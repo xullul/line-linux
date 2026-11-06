@@ -42,6 +42,12 @@ Only Ubuntu 26.10 with GNOME on Wayland has been tested. See
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/xullul/line-linux/main/install.sh | bash
+```
+
+Or from a clone:
+
+```bash
 git clone https://github.com/xullul/line-linux.git
 cd line-linux
 ./install.sh
@@ -51,8 +57,11 @@ cd line-linux
 
 1. Installs missing system packages with apt, dnf, pacman or zypper, which
    asks for your sudo password. An existing Wine, for example from WineHQ,
-   stays as it is. LINE needs Wine 9.0 or later; if the distribution's Wine
-   is older, `install.sh` stops and asks you to install Wine from WineHQ. On Arch, `paru` or `yay` installs the AUR packages if you
+   stays as it is. LINE needs Wine 9.0 or later. On Debian, Ubuntu and
+   distributions based on them, such as Linux Mint, whose own Wine is older,
+   it offers to add [WineHQ's](https://gitlab.winehq.org/wine/wine/-/wikis/Download)
+   apt repository and install Wine from there. Elsewhere it stops and asks
+   you to install a current Wine yourself. On Arch, `paru` or `yay` installs the AUR packages if you
    have one. Without one, build them with `makepkg -si` from
    `https://aur.archlinux.org/osslsigncode.git` and
    `https://aur.archlinux.org/font-symbola.git`. The separate `ttf-symbola`
@@ -68,7 +77,9 @@ cd line-linux
 
 Then start LINE from the app grid or with `line-linux launch`.
 
-`--yes` skips the package manager's confirmation. `--no-deps` skips system
+Options go after `bash -s --` when piping, for example
+`curl -fsSL … | bash -s -- --yes`. `--yes` skips the package manager's
+confirmation and the WineHQ question. `--no-deps` skips system
 packages. `--dry-run` only checks that the packages exist, and lists AUR
 packages without checking them.
 
@@ -119,7 +130,7 @@ line-linux uninstall    remove what setup added (see below)
 | Variable | Default | Meaning |
 |---|---|---|
 | `LINE_PREFIX` | the prefix saved with `line-linux prefix`, else `~/.local/share/line-linux/prefix` | Wine prefix |
-| `LINE_WINE` | `wine` | Wine binary, with `wineserver` in the same folder |
+| `LINE_WINE` | `wine` | Wine binary. `wineserver` is looked for next to it, then on PATH and in Wine's usual library folders |
 | `LINE_CAPTURE_SHORTCUT` | `<Shift><Super>s` | Capture key |
 | `LINE_KEEP_SHADOWS` | unset | `1` keeps LINE's window shadows |
 | `LINE_KEEP_ZONE_FILES` | unset | `1` keeps Wine's `:Zone.Identifier` files next to downloads |
@@ -295,34 +306,36 @@ updates.
 ## Compatibility
 
 LINE 26.x needs Wine 9.0 or later. Under Wine 8.0 and older, its installer
-stops at 1%. `deps` and `install` stop with a message when the
-distribution only has an older Wine; install a current one from
-[WineHQ](https://gitlab.winehq.org/wine/wine/-/wikis/Download) then.
+stops at 1%. Where the distribution's Wine is older, `deps` installs Wine
+from WineHQ on Debian and Ubuntu, and stops with a message elsewhere.
 
 ### Distributions
 
-Tested with LINE 26.6.0.4004 on 2026-11-06. "Starts" means the official
-installer ran and LINE showed its login screen; login was tested only on the
-first row.
+Tested with LINE 26.6.0.4004 on 2026-11-06. "Starts" means `install.sh`
+installed the packages, the official installer ran and LINE showed its
+login screen; login was tested only on the first row.
 
 | Distribution | Wine | Result |
 |---|---|---|
 | Ubuntu 26.10 | 11.0 from WineHQ | Works: login, chats, Thai text, emoji, settings, screenshots pasted into chats |
+| Ubuntu 26.04 | 10.0 (Ubuntu) | Starts, installed with the `curl … \| bash` command |
 | Ubuntu 24.04 | 9.0 (Ubuntu) | Starts. `deps` adds `wine32:i386` |
-| Ubuntu 22.04 | 11.0 from WineHQ | Starts. Ubuntu's own Wine 6.0 is too old |
-| Ubuntu 20.04 | 10.0 from WineHQ | Starts. Ubuntu's own Wine 5.0 is too old. No GTK 4, so copied images don't paste into LINE |
-| Ubuntu 18.04, 16.04 | none | Not possible: Ubuntu has Wine 3.0 and 1.6, WineHQ stops at 8.0 and 5.0 |
+| Ubuntu 22.04 | 11.0 from WineHQ | Starts. Ubuntu's own Wine 6.0 is too old, so `deps` installs WineHQ's |
+| Ubuntu 20.04 | 10.0 from WineHQ | Starts. No GTK 4, so copied images don't paste into LINE |
 | Debian 13 | 10.0 (Debian) | Starts. `deps` adds `wine32:i386` |
-| Debian 12 | 8.0 (Debian) | Too old. Use WineHQ's Wine |
+| Debian 12 | 11.0 from WineHQ | Starts. Debian's own Wine 8.0 is too old, so `deps` installs WineHQ's, also over an installed 8.0 |
+| Fedora 43 | 11.0 Staging (Fedora) | Starts |
+| openSUSE Tumbleweed | 11.20 (openSUSE) | Starts |
 | Arch | 11.21 (Arch) | Starts. osslsigncode and Symbola come from the AUR |
-| AlmaLinux 10 | none | Not possible with packages: no Wine in the distribution or EPEL, and WineHQ doesn't build for RHEL |
-| AlmaLinux 9 | none | Not possible with packages: EPEL's Wine 8.0 is too old and can't be installed on 9.8 (it needs `mesa-libOSMesa`) |
-| AlmaLinux 8 | 6.0 (EPEL) | Too old |
-| Fedora 43, openSUSE Tumbleweed | | Not tested. `install.sh --dry-run` found all packages |
+| Linux Mint 22.3 | | Not tested yet. Based on Ubuntu 24.04 |
 
-Ubuntu 26.10 ran on real hardware. Ubuntu 24.04, Debian 13 and Arch also
-ran in Distrobox containers on it, and every distribution in its own Podman
-container with a virtual X display.
+Not possible: Ubuntu 18.04 and 16.04 (no Wine 9.0 or later exists for them),
+and AlmaLinux and other RHEL-based systems (no usable Wine in the
+distribution or EPEL, and WineHQ doesn't build for them).
+
+Ubuntu 26.10 ran on real hardware. The others ran in Podman containers with
+a virtual X display, and Debian 13 and Kubuntu 24.04 also as live systems in
+a VM.
 
 ### Desktops
 

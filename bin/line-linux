@@ -32,6 +32,10 @@ INSTALLER_URL=https://desktop.line-scdn.net/win/new/LineInst.exe
 CAPTURE_SHORTCUT=${LINE_CAPTURE_SHORTCUT:-<Shift><Super>s}
 
 export WINEPREFIX="$PREFIX"
+# For wineboot: skip the Mono and Gecko installers, and keep Wine's menu
+# builder from registering Wine as the handler for .chm, .vbs and other file
+# types from this prefix.
+BOOT_OVERRIDES="mscoree,mshtml=;winemenubuilder.exe=d"
 export WINEDEBUG=${WINEDEBUG:--all}
 # Wine sees fonts through this config; see ensure_font_view.
 export FONTCONFIG_FILE="$STATE/fontconfig.conf"
@@ -73,6 +77,22 @@ forget_signed() {
   [[ -f $(SIGNED_LIST) ]] || return 0
   grep -vxF "$PREFIX" "$(SIGNED_LIST)" >"$(SIGNED_LIST).new" || true  # empty result is fine
   mv -f "$(SIGNED_LIST).new" "$(SIGNED_LIST)"
+}
+
+# wineserver sits next to wine in WineHQ builds and most packages, but
+# Ubuntu 26.04 ships it only in its library folder.
+wineserver_run() {
+  if [[ -z ${_WINESERVER:-} ]]; then
+    local w c
+    w=$(command -v "$WINE" 2>/dev/null || true)
+    for c in "${w:+$(dirname "$w")/}${WINE##*/}server" "$(command -v wineserver 2>/dev/null || true)" \
+             /usr/lib/wine/wineserver /usr/lib/x86_64-linux-gnu/wine/wineserver /usr/lib64/wine/wineserver \
+             /usr/lib/wine/wineserver64; do
+      [[ -n $c && -x $c ]] && { _WINESERVER=$c; break; }
+    done
+    [[ -n ${_WINESERVER:-} ]] || { warn "Can't find wineserver next to $WINE"; return 1; }
+  fi
+  "$_WINESERVER" "$@"
 }
 
 wine_version() { command -v "$WINE" >/dev/null 2>&1 && "$WINE" --version 2>/dev/null; }
@@ -234,11 +254,11 @@ dll_renames_pending() {
 # "newer than the marker" check can't see them. Apply the queue before signing.
 apply_pending_renames() {
   local i
-  "${WINE}server" -w 2>/dev/null || true
+  wineserver_run -w 2>/dev/null || true
   for i in 1 2 3; do
     dll_renames_pending || return 0
-    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -r >/dev/null 2>&1 || true
-    "${WINE}server" -w 2>/dev/null || true
+    WINEDLLOVERRIDES="$BOOT_OVERRIDES" "$WINE" wineboot -r >/dev/null 2>&1 || true
+    wineserver_run -w 2>/dev/null || true
   done
   warn "Wine still has file replacements queued; if LINE reports NO_SIGNATURE, run: line-linux sign"
 }
@@ -253,8 +273,8 @@ cmd_sign() {
   # now, before signing, so it doesn't undo the signatures at LINE's start.
   if [[ ! -f "$m" || "$(cat "$m")" != "$(wine_version)" ]]; then
     log "Updating the Wine prefix for $(wine_version)"
-    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -u >/dev/null 2>&1 || true
-    "${WINE}server" -w || true
+    WINEDLLOVERRIDES="$BOOT_OVERRIDES" "$WINE" wineboot -u >/dev/null 2>&1 || true
+    wineserver_run -w || true
   fi
   log "Signing Wine DLLs in $PREFIX (only files without a valid signature)"
   # Wine can still be rewriting DLLs right after creating or updating a prefix,
@@ -306,6 +326,7 @@ REQUIREMENTS=(
   "cmd:osslsigncode    | osslsigncode  | osslsigncode          | aur:osslsigncode | osslsigncode"
   "cmd:openssl         | openssl       | openssl               | openssl          | openssl"
   "cmd:curl            | curl          | curl                  | curl             | curl"
+  "cmd:awk             | gawk          | gawk                  | gawk             | gawk"
   "cmd:fc-list         | fontconfig    | fontconfig            | fontconfig       | fontconfig"
   "cmd:python3         | python3       | python3               | python           | python3"
   "py:gi               | python3-gi    | python3-gobject       | python-gobject   | python3-gobject"
@@ -367,6 +388,57 @@ wine_candidate() {  # wine_candidate PM
   printf '%s' "$v"
 }
 
+# WineHQ's apt repository for this system: sets WINEHQ_DIST (ubuntu or
+# debian), WINEHQ_CODENAME and WINEHQ_VERSION, and succeeds if WineHQ builds a
+# Wine that LINE can use for it. Derivatives such as Linux Mint use the
+# codename of the Ubuntu or Debian release they're based on.
+winehq_find() {
+  local id like codename ubuntu_codename
+  [[ -r /etc/os-release ]] || return 1
+  # shellcheck disable=SC1091
+  id=$(. /etc/os-release; echo "${ID:-}"); like=$(. /etc/os-release; echo "${ID_LIKE:-}")
+  codename=$(. /etc/os-release; echo "${VERSION_CODENAME:-}")
+  ubuntu_codename=$(. /etc/os-release; echo "${UBUNTU_CODENAME:-}")
+  if [[ $id == ubuntu || " $like " == *" ubuntu "* ]]; then
+    WINEHQ_DIST=ubuntu WINEHQ_CODENAME=${ubuntu_codename:-$codename}
+  elif [[ $id == debian || " $like " == *" debian "* ]]; then
+    WINEHQ_DIST=debian WINEHQ_CODENAME=$codename
+  else
+    return 1
+  fi
+  [[ $(dpkg --print-architecture 2>/dev/null) == amd64 && -n $WINEHQ_CODENAME ]] || return 1
+  WINEHQ_VERSION=$(curl -fsSL --proto '=https' \
+      "https://dl.winehq.org/wine-builds/$WINEHQ_DIST/dists/$WINEHQ_CODENAME/main/binary-amd64/Packages" 2>/dev/null |
+    awk '/^Package: /{p = $2} p == "wine-stable" && /^Version: /{print $2}' | sort -V | tail -1 || true)
+  [[ -n $WINEHQ_VERSION && ${WINEHQ_VERSION%%[!0-9]*} -ge $MIN_WINE ]]
+}
+
+# Add WineHQ's apt repository and install winehq-stable, after asking unless
+# --yes was given. This changes the system's package sources, so it says so.
+winehq_install() {  # winehq_install REASON [-y]
+  local reason=$1; shift
+  log "$reason"
+  log "WineHQ builds Wine $WINEHQ_VERSION for $WINEHQ_DIST $WINEHQ_CODENAME. line-linux can add WineHQ's apt repository (https://dl.winehq.org) to your package sources and install winehq-stable."
+  if [[ ${1:-} != -y ]]; then
+    local answer=
+    [[ -r /dev/tty ]] || die "Run 'line-linux deps --yes' to allow this, or install Wine from WineHQ yourself."
+    read -r -p "Add WineHQ's repository and install Wine $WINEHQ_VERSION? [y/N] " answer </dev/tty
+    [[ $answer == [yY]* ]] || die "Install Wine $MIN_WINE.0 or later yourself, then run this again."
+  fi
+  local base="https://dl.winehq.org/wine-builds"
+  as_root mkdir -pm755 /etc/apt/keyrings
+  curl -fsSL --proto '=https' "$base/winehq.key" | as_root tee /etc/apt/keyrings/winehq-archive.key >/dev/null
+  curl -fsSL --proto '=https' "$base/$WINEHQ_DIST/dists/$WINEHQ_CODENAME/winehq-$WINEHQ_CODENAME.sources" |
+    as_root tee "/etc/apt/sources.list.d/winehq-$WINEHQ_CODENAME.sources" >/dev/null
+  dpkg --print-foreign-architectures | grep -qx i386 || as_root dpkg --add-architecture i386
+  apt_update
+  as_root apt-get install "$@" --install-recommends winehq-stable
+  hash -r
+  command -v "$WINE" >/dev/null || die "winehq-stable is installed, but there's no \"$WINE\" command on PATH"
+  wine_too_old && die "$(wine_too_old_message)"
+  log "Installed $(wine_version) from WineHQ"
+}
+
 pkg_available() {  # pkg_available PM PACKAGE
   case $1 in
     apt-get) apt-get install -s "$2" >/dev/null 2>&1 ;;
@@ -387,17 +459,36 @@ cmd_deps() {
     *) die "No supported package manager (apt, dnf, pacman, zypper). Install the packages listed in the README yourself." ;; esac
 
   # A distribution's own Wine can be too old for LINE (Debian 12, Ubuntu
-  # 22.04 and older) or missing (AlmaLinux 10). Say so before installing the
-  # rest, and before pulling in hundreds of MB of 32-bit libraries for it.
+  # 22.04 and older) or missing (AlmaLinux 10). Deal with that before
+  # installing the rest, and before pulling in hundreds of MB of 32-bit
+  # libraries for a Wine that can't run LINE.
+  local reason=
   if requirement_missing cmd:wine; then
     [[ $pm == apt-get ]] && (( !dry )) && { apt_update; updated=1; }
     local cand; cand=$(wine_candidate "$pm")
     if [[ -z $cand ]]; then
-      die "$pm has no Wine package. Install Wine $MIN_WINE.0 or later from WineHQ
-  (https://gitlab.winehq.org/wine/wine/-/wikis/Download), then run this again."
+      reason="$pm has no Wine package."
     elif [[ ${cand%%[!0-9]*} -lt $MIN_WINE ]]; then
-      die "$pm would install Wine $cand, which is too old for LINE: its installer stops at 1% on Wine older than $MIN_WINE.0.
-  Install a current Wine from WineHQ (https://gitlab.winehq.org/wine/wine/-/wikis/Download),
+      reason="$pm would install Wine $cand, which is too old for LINE: its installer stops at 1% on Wine older than $MIN_WINE.0."
+    fi
+  elif wine_too_old; then
+    reason="$(wine_version) is installed, which is too old for LINE: its installer stops at 1% on Wine older than $MIN_WINE.0."
+  fi
+  if [[ -n $reason ]]; then
+    # Looking WineHQ up needs curl, which a minimal system may not have yet.
+    if [[ $pm == apt-get ]] && ! command -v curl >/dev/null && (( !dry )); then
+      log "Installing curl to look up WineHQ's packages (needs sudo)"
+      as_root apt-get install "${yes[@]}" curl ca-certificates
+    fi
+    if [[ $pm == apt-get ]] && winehq_find; then
+      if (( dry )); then
+        log "$reason Would add WineHQ's repository and install Wine $WINEHQ_VERSION (winehq-stable)"
+      else
+        winehq_install "$reason" "${yes[@]}"
+      fi
+    else
+      die "$reason
+  Install Wine $MIN_WINE.0 or later from WineHQ (https://gitlab.winehq.org/wine/wine/-/wikis/Download),
   then run this again."
     fi
   fi
@@ -488,6 +579,7 @@ cmd_install() {
   separate copy:     $SELF prefix ~/.local/share/line-linux/prefix"
   fi
   need curl; need osslsigncode
+  [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} ]] || die "LINE's installer needs a desktop session. Run this from a terminal on your desktop."
   command -v "$WINE" >/dev/null || die "Wine is not installed. Run: line-linux deps"
   wine_too_old && die "$(wine_too_old_message)"
   # LINE's installer is 32-bit. A Wine without 32-bit support creates a
@@ -497,14 +589,14 @@ cmd_install() {
   local wow="$PREFIX/drive_c/windows/syswow64/ntdll.dll"
   if [[ -f "$PREFIX/system.reg" && ! -f $wow && $PREFIX == "$STATE/prefix" && ! -d $LINE_DIR ]]; then
     log "The Wine prefix has no 32-bit support; creating it again"
-    "${WINE}server" -k 2>/dev/null || true
+    wineserver_run -k 2>/dev/null || true
     rm -rf "$PREFIX"
   fi
   if [[ ! -f "$PREFIX/system.reg" ]]; then
     log "Creating Wine prefix $PREFIX"
     mkdir -p "$PREFIX"
-    WINEARCH=win64 WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -i >/dev/null 2>&1
-    "${WINE}server" -w || true
+    WINEARCH=win64 WINEDLLOVERRIDES="$BOOT_OVERRIDES" "$WINE" wineboot -i >/dev/null 2>&1
+    wineserver_run -w || true
   fi
   if [[ ! -f $wow ]]; then
     if [[ $PREFIX == "$STATE/prefix" && ! -d $LINE_DIR ]]; then
@@ -527,12 +619,11 @@ cmd_install() {
   verify_installer "$exe"
   # Keep Wine from making menu and desktop entries for LINE; see cmd_desktop.
   reg_set_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe ''
-  "$WINE" "$exe"
+  "$WINE" "$exe" || true
+  [[ -f $LAUNCHER ]] || die "LINE's installer closed before LINE was installed. Run this again to retry: $SELF install"
   # The installer starts LINE, which unpacks bin/current (and the icon the
   # app-grid entry uses) a few seconds after the installer exits.
-  if [[ -f $LAUNCHER ]]; then
-    local i; for i in {1..60}; do install_icon && break; sleep 1; done
-  fi
+  local i; for i in {1..60}; do install_icon && break; sleep 1; done
   cmd_sign
 }
 
@@ -542,11 +633,13 @@ cmd_install() {
 verify_installer() {
   [[ "$(head -c2 "$1")" == MZ ]] || die "Download is not a Windows executable"
   local out cur calc ca=() b
-  # osslsigncode 2.2 (Ubuntu 22.04) prints nothing without -CAfile. Any CA
-  # bundle will do: the chain fails either way, and only the digests and the
-  # signer below are checked.
+  # Without -CAfile, osslsigncode prints nothing when it finds no default CA
+  # store (2.2 in Ubuntu 22.04, 2.14 in openSUSE). Any certificate will do:
+  # the chain fails either way, and only the digests and the signer below are
+  # checked.
   if ossl_has_cafile; then
-    for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+    for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem \
+             /var/lib/ca-certificates/ca-bundle.pem "$STATE/cert.pem"; do
       [[ -f $b ]] && { ca=(-CAfile "$b"); break; }
     done
   fi
@@ -678,6 +771,12 @@ install_icon() {
   command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$ICONS" 2>/dev/null || true
 }
 
+# True if a desktop entry Wine wrote runs a program from this prefix. Wine
+# writes WINEPREFIX="/path" or "WINEPREFIX=/path" depending on its version.
+for_this_prefix() {
+  grep -qF -e "WINEPREFIX=\"$PREFIX\"" -e "\"WINEPREFIX=$PREFIX\"" "$1"
+}
+
 cmd_desktop() {
   install_icon || true
   mkdir -p "$APPS" "$HOME/.local/bin"
@@ -712,10 +811,18 @@ EOF
   # Linux one, and Wine turned it into LINE.desktop. Both start LINE without
   # line-linux; desktops that show icons (KDE, Xfce) display them. Remove
   # them only when they point at this prefix's LINE.
-  local desk f; desk=$(xdg_dir DESKTOP Desktop)
+  # Older line-linux versions let Wine register file types (.chm, .vbs, …)
+  # from line-linux's own prefix. Remove those; a shared prefix keeps its own.
+  local desk f
+  if [[ $PREFIX == "$STATE/prefix" ]]; then
+    for f in "$APPS"/wine-extension-*.desktop; do
+      [[ -f $f ]] && for_this_prefix "$f" && rm -f "$f"
+    done
+  fi
+  desk=$(xdg_dir DESKTOP Desktop)
   for f in "$desk/LINE.desktop" "$desk/LINE.lnk"; do
     [[ -f $f ]] || continue
-    if [[ $f == *.desktop ]]; then grep -qF "WINEPREFIX=\"$PREFIX\"" "$f" || continue
+    if [[ $f == *.desktop ]]; then for_this_prefix "$f" || continue
     else grep -qa 'LineLauncher' "$f" && [[ -f $LAUNCHER ]] || continue; fi
     rm -f "$f"
   done
