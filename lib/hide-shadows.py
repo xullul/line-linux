@@ -26,6 +26,7 @@ import sys
 import time
 
 MAX_THICKNESS = 40          # main windows use 11 px shadows, dialogs 20 px
+MAX_FRAME_DEPTH = 3         # levels below the root to look for reparented windows
 
 x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
 xext = ctypes.CDLL(ctypes.util.find_library("Xext") or "libXext.so.6")
@@ -205,12 +206,13 @@ def hide(dpy, win):
 
 def scan(dpy, root):
     """Hide every current LINE shadow window; return how many were found."""
-    # Top-level windows, plus one level down in case the window manager
-    # reparented a titled LINE window into a frame.
-    windows = []
-    for top in children(dpy, root):
-        windows.append(top)
-        windows.extend(children(dpy, top))
+    # Top-level windows, plus a few levels down: window managers reparent
+    # titled windows into frames, GNOME's one level deep and KWin's two
+    # (frame, then wrapper, then the client).
+    windows, level = [], children(dpy, root)
+    for _ in range(MAX_FRAME_DEPTH + 1):
+        windows.extend(level)
+        level = [kid for win in level for kid in children(dpy, win)]
     titled, candidates = [], []
     for win in windows:
         info = line_window(dpy, root, win)

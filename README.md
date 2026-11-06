@@ -51,8 +51,12 @@ cd line-linux
 
 1. Installs missing system packages with apt, dnf, pacman or zypper, which
    asks for your sudo password. An existing Wine, for example from WineHQ,
-   stays as it is. On Arch, `paru` or `yay` installs the AUR packages if you
-   have one.
+   stays as it is. LINE needs Wine 9.0 or later; if the distribution's Wine
+   is older, `install.sh` stops and asks you to install Wine from WineHQ. On Arch, `paru` or `yay` installs the AUR packages if you
+   have one. Without one, build them with `makepkg -si` from
+   `https://aur.archlinux.org/osslsigncode.git` and
+   `https://aur.archlinux.org/font-symbola.git`. The separate `ttf-symbola`
+   repository is an old version whose download no longer exists.
 2. Copies the tool to `~/.local/share/line-linux/app` and links `line-linux`
    into `~/.local/bin`. You can delete the cloned folder afterwards.
 3. Creates a Wine prefix only for LINE in `~/.local/share/line-linux/prefix`
@@ -78,13 +82,16 @@ prefix only for LINE is safer.
 
 | Purpose | Debian / Ubuntu | Fedora | Arch | openSUSE |
 |---|---|---|---|---|
-| Wine | `wine` | `wine` | `wine` | `wine` |
+| Wine 9.0 or later | `wine`, plus `wine32:i386` for the distribution's own Wine | `wine` | `wine` | `wine` |
 | DLL signing | `osslsigncode`, `openssl` | same | `osslsigncode` (AUR), `openssl` | same |
 | Download | `curl` | `curl` | `curl` | `curl` |
 | Fonts | `fontconfig`, `fonts-symbola` | `fontconfig`, `gdouros-symbola-fonts` | `fontconfig`, `ttf-symbola` (AUR) | `fontconfig`, `gdouros-symbola-fonts` |
 | Shadow fix, capture shortcut | `python3`, `python3-gi` | `python3`, `python3-gobject` | `python`, `python-gobject` | `python3`, `python3-gobject` |
 | Pasting images into LINE | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
 | Fallback capture command | `xclip` | `xclip` | `xclip` | `xclip` |
+
+GTK 4, Symbola and xclip are optional. When the distribution has no package
+for one of them, `deps` says which feature is missing and continues.
 
 The helpers also use libX11, libXext and libxkbcommon, which every X11 or
 Wayland desktop has. If `xdg-user-dirs` is installed, line-linux uses it to
@@ -152,6 +159,11 @@ A Wine upgrade also rewrites the DLLs. `launch` records which Wine version
 it signed for. When the version changes, it runs `wineboot -u` and signs
 again before starting LINE.
 
+`wineboot -u` can't replace DLLs that Wine has loaded itself. Wine 11.21
+queues those and moves the new, unsigned copies into place the next time
+it starts, with the old modification time. `sign` therefore runs
+`wineboot -r` to apply the queue before it signs.
+
 line-linux changes only the DLL copies inside the LINE prefix. It doesn't
 modify LINE, and it never adds the certificate to a trust store. Anyone who
 can read `~/.local/share/line-linux/key.pem` could sign files that pass the
@@ -180,15 +192,18 @@ your normal fonts.
 
 LINE draws each window's shadow as eight thin, untitled windows, 11 px wide
 around main windows and 20 px around dialogs. Wine creates most of them as
-override-redirect X windows, and GNOME keeps those above every app. They
-stayed on screen after you switched to another app.
+override-redirect X windows, which GNOME and KDE Plasma keep above every
+app. They stayed on screen after you switched to another app.
 
 `launch` starts `lib/hide-shadows.py`. It treats an untitled LINE window
-lying along the outside edge of a titled LINE window as a shadow. It sets
+lying along the outside edge of a titled LINE window as a shadow. It looks
+for titled windows inside window-manager frames too, which GNOME nests one
+level deep and KWin two. It sets
 the shadow's opacity to 0 and gives it an empty X shape, so clicks pass
 through. Without the opacity change, GNOME still paints a small corner wedge
 for the window. If Wine changes either setting later, the helper applies it
 again. It exits when LINE exits, and leaves tooltips and menus alone.
+`setup` also starts it for the LINE window that the installer opens.
 
 ### Screen capture
 
@@ -279,14 +294,50 @@ updates.
 
 ## Compatibility
 
-| Setup | Status |
+LINE 26.x needs Wine 9.0 or later. Under Wine 8.0 and older, its installer
+stops at 1%. `deps` and `install` stop with a message when the
+distribution only has an older Wine; install a current one from
+[WineHQ](https://gitlab.winehq.org/wine/wine/-/wikis/Download) then.
+
+### Distributions
+
+Tested with LINE 26.6.0.4004 on 2026-11-06. "Starts" means the official
+installer ran and LINE showed its login screen; login was tested only on the
+first row.
+
+| Distribution | Wine | Result |
+|---|---|---|
+| Ubuntu 26.10 | 11.0 from WineHQ | Works: login, chats, Thai text, emoji, settings, screenshots pasted into chats |
+| Ubuntu 24.04 | 9.0 (Ubuntu) | Starts. `deps` adds `wine32:i386` |
+| Ubuntu 22.04 | 11.0 from WineHQ | Starts. Ubuntu's own Wine 6.0 is too old |
+| Ubuntu 20.04 | 10.0 from WineHQ | Starts. Ubuntu's own Wine 5.0 is too old. No GTK 4, so copied images don't paste into LINE |
+| Ubuntu 18.04, 16.04 | none | Not possible: Ubuntu has Wine 3.0 and 1.6, WineHQ stops at 8.0 and 5.0 |
+| Debian 13 | 10.0 (Debian) | Starts. `deps` adds `wine32:i386` |
+| Debian 12 | 8.0 (Debian) | Too old. Use WineHQ's Wine |
+| Arch | 11.21 (Arch) | Starts. osslsigncode and Symbola come from the AUR |
+| AlmaLinux 10 | none | Not possible with packages: no Wine in the distribution or EPEL, and WineHQ doesn't build for RHEL |
+| AlmaLinux 9 | none | Not possible with packages: EPEL's Wine 8.0 is too old and can't be installed on 9.8 (it needs `mesa-libOSMesa`) |
+| AlmaLinux 8 | 6.0 (EPEL) | Too old |
+| Fedora 43, openSUSE Tumbleweed | | Not tested. `install.sh --dry-run` found all packages |
+
+Ubuntu 26.10 ran on real hardware. Ubuntu 24.04, Debian 13 and Arch also
+ran in Distrobox containers on it, and every distribution in its own Podman
+container with a virtual X display.
+
+### Desktops
+
+| Desktop | Result |
 |---|---|
-| Ubuntu 26.10, GNOME 51 on Wayland, Wine 11.0 from WineHQ, LINE 26.6.0.4004 | Tested: install through the official installer, login, chats, Thai text, emoji, settings, window shadows, Super+Shift+S with English and Thai layouts, pasting a screenshot into a chat |
-| Ubuntu 24.04, Debian 13, Fedora 43, Arch, openSUSE Tumbleweed | Not tested. `install.sh --dry-run` found all official packages; AUR packages weren't checked |
-| Older Wine, such as 9.0 in Ubuntu 24.04 | Not tested. `deps` warns about Wine older than 10 |
-| KDE Plasma, Xfce and other desktops | Not tested. The capture key needs GNOME Shell. Use your desktop's screenshot tool with copy to clipboard instead |
-| X11 sessions | Not tested. LINE's own screenshot button may work there |
-| LINE's own screenshot button | Doesn't work on Wayland, see [Screen capture](#screen-capture) |
+| GNOME 51 on Wayland (Ubuntu 26.10) | Works, including window shadows, Super+Shift+S with English and Thai layouts, and pasting screenshots |
+| KDE Plasma 6.3 on Wayland (Debian 13 live, in a VM) | Starts. Window shadows hidden, app-grid entry and taskbar icon, a copied image offered as a file. Copy screenshots with Spectacle: the capture key needs GNOME Shell. KWin passes the clipboard to LINE only while a LINE window has focus, which it has when you press Ctrl+V |
+| KDE Plasma 5.27 on X11 (Kubuntu 24.04 live, in a VM) | Starts. Window shadows hidden, app-grid entry and taskbar icon |
+| Xfce and other desktops | Not tested. Use your desktop's screenshot tool with copy to clipboard |
+
+### Features
+
+| Feature | Status |
+|---|---|
+| LINE's own screenshot button | Doesn't work on Wayland, see [Screen capture](#screen-capture). Not tested on X11 |
 | Downloading a file from a chat with the current folder and marker-file handling | Not confirmed yet |
 | Voice and video calls | Not tested |
 

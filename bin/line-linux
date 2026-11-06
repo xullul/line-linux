@@ -153,7 +153,35 @@ ensure_font_view() {
 # A file counts as signed only when its signature verifies with our own
 # certificate as the sole trusted root. Unsigned files, files signed by anyone
 # else, and files changed after signing all fail.
-is_signed() { osslsigncode verify -CAfile "$STATE/cert.pem" -in "$1" >/dev/null 2>&1; }
+is_signed() {
+  if ossl_has_cafile; then
+    osslsigncode verify -CAfile "$STATE/cert.pem" -in "$1" >/dev/null 2>&1
+  else
+    # osslsigncode 2.0 (Ubuntu 20.04) has no -CAfile and doesn't check the
+    # chain; it still fails on a changed file. Require our certificate as the
+    # signer by its serial number.
+    local out signer
+    out=$(osslsigncode verify -in "$1" 2>/dev/null || true)
+    [[ $out == *Succeeded* ]] || return 1
+    signer=$(sed -n '/Signer #0:/,/Serial/p' <<<"$out")
+    [[ ${signer^^} =~ SERIAL\ :\ $(cert_serial)[[:space:]]*$ ]]
+  fi
+}
+# Cached answers, computed once per run.
+ossl_has_cafile() {
+  if [[ -z ${_OSSL_CAFILE:-} ]]; then
+    local out; out=$(osslsigncode verify -CAfile /dev/null -in /dev/null 2>&1 || true)
+    _OSSL_CAFILE=1
+    [[ $out == *Usage:* ]] && _OSSL_CAFILE=0
+  fi
+  (( _OSSL_CAFILE ))
+}
+cert_serial() {
+  [[ -n ${_CERT_SERIAL:-} ]] ||
+    _CERT_SERIAL=$(openssl x509 -in "$STATE/cert.pem" -noout -serial)
+  _CERT_SERIAL=${_CERT_SERIAL#serial=}; _CERT_SERIAL=${_CERT_SERIAL^^}
+  printf '%s' "$_CERT_SERIAL"
+}
 
 ensure_certificate() {
   [[ -s "$STATE/cert.pem" && -s "$STATE/key.pem" ]] && return 0
@@ -185,7 +213,34 @@ signing_current() {
   [[ -f "$m" ]] || return 1
   [[ "$(cat "$m")" == "$(wine_version)" ]] || return 1
   is_signed "$PREFIX/drive_c/windows/system32/crypt32.dll" || return 1
+  ! dll_renames_pending || return 1
   ! find_dlls -newer "$m" -print -quit | grep -q .
+}
+
+# True if Wine's queue of file replacements holds a file in system32 or
+# syswow64. Other entries, such as an installer deleting its temp copy, don't
+# matter. Long registry values continue on the next line after a backslash.
+dll_renames_pending() {
+  local queue
+  queue=$(awk '/^"PendingFileRenameOperations"=/ { on = 1 }
+               on { more = sub(/\\$/, ""); printf "%s", $0; if (!more) exit }' "$PREFIX/system.reg" 2>/dev/null || true)
+  [[ ${queue,,} =~ windows\\\\(system32|syswow64)\\\\ ]]
+}
+
+# wineboot -u can't replace DLLs that Wine itself has loaded. Wine 11.x
+# writes those as dllXXXX.tmp, queues them in PendingFileRenameOperations and
+# moves them into place on its next start, putting unsigned copies over the
+# signed ones. The moved files keep the .tmp file's older mtime, so the
+# "newer than the marker" check can't see them. Apply the queue before signing.
+apply_pending_renames() {
+  local i
+  "${WINE}server" -w 2>/dev/null || true
+  for i in 1 2 3; do
+    dll_renames_pending || return 0
+    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -r >/dev/null 2>&1 || true
+    "${WINE}server" -w 2>/dev/null || true
+  done
+  warn "Wine still has file replacements queued; if LINE reports NO_SIGNATURE, run: line-linux sign"
 }
 
 cmd_sign() {
@@ -208,7 +263,7 @@ cmd_sign() {
   # the marker that later quick checks rely on.
   local count=0 pass signed failed
   for pass in 1 2 3; do
-    "${WINE}server" -w 2>/dev/null || true
+    apply_pending_renames
     signed=$(find_dlls -print0 |
       xargs -0 -r -n 32 -P "$(nproc)" "$SELF" _sign-files 2>"$STATE/sign-errors.txt" | wc -l)
     count=$((count + signed))
@@ -242,8 +297,10 @@ cmd_unsign() {
 
 # --------------------------------------------------------------- packages --
 
-# One line per requirement: check | apt | dnf | pacman | zypper package.
-# "aur:" marks a package that's only in the Arch User Repository.
+# One line per requirement: check | apt | dnf | pacman | zypper package, and
+# for optional ones what is lost without it. Some distributions lack an
+# optional package (no GTK 4 before Ubuntu 22.04, no Symbola in EPEL); deps
+# then says so and carries on. "aur:" marks a package only in the AUR.
 REQUIREMENTS=(
   "cmd:wine            | wine          | wine                  | wine             | wine"
   "cmd:osslsigncode    | osslsigncode  | osslsigncode          | aur:osslsigncode | osslsigncode"
@@ -252,9 +309,9 @@ REQUIREMENTS=(
   "cmd:fc-list         | fontconfig    | fontconfig            | fontconfig       | fontconfig"
   "cmd:python3         | python3       | python3               | python           | python3"
   "py:gi               | python3-gi    | python3-gobject       | python-gobject   | python3-gobject"
-  "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0"
-  "cmd:xclip           | xclip         | xclip                 | xclip            | xclip"
-  "font:Symbola        | fonts-symbola | gdouros-symbola-fonts | aur:ttf-symbola  | gdouros-symbola-fonts"
+  "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0 | pasting copied images and screenshots into LINE"
+  "cmd:xclip           | xclip         | xclip                 | xclip            | xclip               | the capture command's clipboard copy"
+  "font:Symbola        | fonts-symbola | gdouros-symbola-fonts | aur:ttf-symbola  | gdouros-symbola-fonts | emoji, which show as empty boxes"
 )
 
 trim() { local v=$1; v=${v#"${v%%[![:space:]]*}"}; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
@@ -269,23 +326,97 @@ requirement_missing() {
   esac
 }
 
+# One broken source, such as a live system's cdrom: entry that has no i386
+# index, makes apt-get update fail although the others updated. Carry on:
+# apt-get install still fails if a package is really missing.
+apt_update() {
+  as_root apt-get update || warn "apt-get update reported errors (see above); trying to install anyway"
+}
+
+deb_installed() { [[ $(dpkg-query -W -f='${Status}' "$1" 2>/dev/null) == "install ok installed" ]]; }
+
+# LINE's installer is a 32-bit program. Debian's and Ubuntu's own Wine
+# packages (wine64, up to at least 9.0 in Ubuntu 24.04) run 32-bit programs
+# only with wine32 from the i386 architecture. WineHQ's packages (wine-stable
+# etc.) bring their own 32-bit support, so leave those alone.
+apt_wine32() {  # apt_wine32 DRY [-y]
+  local dry=$1; shift
+  if (( dry )); then
+    deb_installed wine32:i386 ||
+      log "If Wine comes from the distribution's wine64 package: would enable the i386 architecture and install wine32:i386"
+    return 0
+  fi
+  deb_installed wine64 && ! deb_installed wine32:i386 || return 0
+  log "Wine needs wine32:i386 to run LINE's 32-bit installer; enabling the i386 architecture (needs sudo)"
+  dpkg --print-foreign-architectures | grep -qx i386 || as_root dpkg --add-architecture i386
+  apt_update
+  as_root apt-get install "$@" wine32:i386
+}
+
+# The version of Wine the package manager would install, or nothing.
+wine_candidate() {  # wine_candidate PM
+  local v=
+  case $1 in
+    apt-get) v=$(apt-cache policy wine 2>/dev/null | sed -n 's/^ *Candidate: *//p')
+             [[ $v == "(none)" ]] && v=
+             v=${v#*:} ;;  # drop an epoch
+    dnf)     v=$(dnf -q repoquery --latest-limit 1 --qf '%{version}' wine 2>/dev/null | tail -1) ;;
+    pacman)  v=$(pacman -Si wine 2>/dev/null | sed -n 's/^Version *: *//p') ;;
+    zypper)  v=$(zypper --non-interactive -q info wine 2>/dev/null | sed -n 's/^Version *: *//p') ;;
+  esac
+  printf '%s' "$v"
+}
+
+pkg_available() {  # pkg_available PM PACKAGE
+  case $1 in
+    apt-get) apt-get install -s "$2" >/dev/null 2>&1 ;;
+    dnf)     dnf -q info "$2" >/dev/null 2>&1 ;;
+    pacman)  pacman -Si "$2" >/dev/null 2>&1 ;;
+    zypper)  zypper --non-interactive -q search -x "$2" >/dev/null 2>&1 ;;
+  esac
+}
+
 cmd_deps() {
   local yes=() dry=0 a
   for a in "$@"; do
     case $a in --yes|-y) yes=(-y) ;; --dry-run) dry=1 ;; *) die "deps: unknown option $a" ;; esac
   done
-  local pm col
+  local pm col updated=0
   for pm in apt-get dnf pacman zypper; do command -v "$pm" >/dev/null && break; pm=; done
   case $pm in apt-get) col=1 ;; dnf) col=2 ;; pacman) col=3 ;; zypper) col=4 ;;
     *) die "No supported package manager (apt, dnf, pacman, zypper). Install the packages listed in the README yourself." ;; esac
 
-  local line check pkg pkgs=() aur=()
+  # A distribution's own Wine can be too old for LINE (Debian 12, Ubuntu
+  # 22.04 and older) or missing (AlmaLinux 10). Say so before installing the
+  # rest, and before pulling in hundreds of MB of 32-bit libraries for it.
+  if requirement_missing cmd:wine; then
+    [[ $pm == apt-get ]] && (( !dry )) && { apt_update; updated=1; }
+    local cand; cand=$(wine_candidate "$pm")
+    if [[ -z $cand ]]; then
+      die "$pm has no Wine package. Install Wine $MIN_WINE.0 or later from WineHQ
+  (https://gitlab.winehq.org/wine/wine/-/wikis/Download), then run this again."
+    elif [[ ${cand%%[!0-9]*} -lt $MIN_WINE ]]; then
+      die "$pm would install Wine $cand, which is too old for LINE: its installer stops at 1% on Wine older than $MIN_WINE.0.
+  Install a current Wine from WineHQ (https://gitlab.winehq.org/wine/wine/-/wikis/Download),
+  then run this again."
+    fi
+  fi
+
+  local line check pkg lost pkgs=() aur=()
   for line in "${REQUIREMENTS[@]}"; do
     IFS='|' read -ra f <<<"$line"
-    check=$(trim "${f[0]}"); pkg=$(trim "${f[col]}")
-    if (( dry )) || requirement_missing "$check"; then
-      if [[ $pkg == aur:* ]]; then aur+=("${pkg#aur:}"); else pkgs+=("$pkg"); fi
+    check=$(trim "${f[0]}"); pkg=$(trim "${f[col]}"); lost=$(trim "${f[5]:-}")
+    (( dry )) || requirement_missing "$check" || continue
+    if [[ $pkg == aur:* ]]; then aur+=("${pkg#aur:}"); continue; fi
+    if [[ -n $lost ]]; then
+      # Fresh package lists first, so "not available" means what it says.
+      [[ $pm == apt-get ]] && (( !dry && !updated )) && { apt_update; updated=1; }
+      if ! pkg_available "$pm" "$pkg"; then
+        warn "$pkg isn't available from $pm; without it line-linux can't offer $lost"
+        continue
+      fi
     fi
+    pkgs+=("$pkg")
   done
 
   if (( ${#pkgs[@]} == 0 )); then
@@ -306,7 +437,7 @@ cmd_deps() {
   else
     log "Installing with $pm (needs sudo): ${pkgs[*]}"
     case $pm in
-      apt-get) as_root apt-get update && as_root apt-get install "${yes[@]}" "${pkgs[@]}" ;;
+      apt-get) (( updated )) || apt_update; as_root apt-get install "${yes[@]}" "${pkgs[@]}" ;;
       dnf)     as_root dnf install "${yes[@]}" "${pkgs[@]}" ;;
       pacman)  as_root pacman -S --needed ${yes:+--noconfirm} "${pkgs[@]}" ;;
       zypper)  as_root zypper ${yes:+--non-interactive} install "${pkgs[@]}" ;;
@@ -327,10 +458,21 @@ cmd_deps() {
     fi
   fi
 
-  local v; v=$(wine_version | sed -E 's/^wine-([0-9]+).*/\1/' || true)
-  if [[ $v =~ ^[0-9]+$ ]] && (( v < 10 )); then
-    warn "$(wine_version) is older than the tested 11.0. If LINE misbehaves, install a current Wine from https://wiki.winehq.org/Download"
-  fi
+  [[ $pm == apt-get ]] && apt_wine32 "$dry" "${yes[@]}"
+
+  wine_too_old && warn "$(wine_too_old_message)"
+  return 0
+}
+
+# LINE's installer stops at 1% under Wine 8.0 and 6.0 (Debian 12, Ubuntu
+# 22.04); 9.0 and later work.
+MIN_WINE=9
+wine_major() { wine_version | sed -nE 's/^wine-([0-9]+).*/\1/p'; }
+wine_too_old() { local v; v=$(wine_major); [[ $v =~ ^[0-9]+$ ]] && (( v < MIN_WINE )); }
+wine_too_old_message() {
+  printf '%s is too old for LINE: its installer stops at 1%% on Wine older than %s.0.
+  Install a current Wine from WineHQ (https://gitlab.winehq.org/wine/wine/-/wikis/Download),
+  then run this again. line-linux uses whichever "wine" is first on PATH, or $LINE_WINE.' "$(wine_version)" "$MIN_WINE"
 }
 
 # ------------------------------------------------------------- app & path --
@@ -346,11 +488,32 @@ cmd_install() {
   separate copy:     $SELF prefix ~/.local/share/line-linux/prefix"
   fi
   need curl; need osslsigncode
+  command -v "$WINE" >/dev/null || die "Wine is not installed. Run: line-linux deps"
+  wine_too_old && die "$(wine_too_old_message)"
+  # LINE's installer is 32-bit. A Wine without 32-bit support creates a
+  # prefix with an empty syswow64, and adding 32-bit support later doesn't
+  # repair that prefix. line-linux's own prefix holds nothing else before
+  # LINE is installed, so it is simply created again.
+  local wow="$PREFIX/drive_c/windows/syswow64/ntdll.dll"
+  if [[ -f "$PREFIX/system.reg" && ! -f $wow && $PREFIX == "$STATE/prefix" && ! -d $LINE_DIR ]]; then
+    log "The Wine prefix has no 32-bit support; creating it again"
+    "${WINE}server" -k 2>/dev/null || true
+    rm -rf "$PREFIX"
+  fi
   if [[ ! -f "$PREFIX/system.reg" ]]; then
     log "Creating Wine prefix $PREFIX"
     mkdir -p "$PREFIX"
     WINEARCH=win64 WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -i >/dev/null 2>&1
     "${WINE}server" -w || true
+  fi
+  if [[ ! -f $wow ]]; then
+    if [[ $PREFIX == "$STATE/prefix" && ! -d $LINE_DIR ]]; then
+      die "$(wine_version) can't run 32-bit Windows programs, and LINE's installer is one.
+  Debian/Ubuntu Wine: run '$SELF deps' (it installs wine32:i386), or install Wine from WineHQ.
+  Then run this again."
+    fi
+    die "The prefix $(tilde "$PREFIX") has no 32-bit support (syswow64 is empty), which LINE's installer needs.
+  Use a prefix created with a Wine that has 32-bit support, for example: $SELF prefix ~/.local/share/line-linux/prefix"
   fi
   cmd_sign
   local dir; dir=$(mktemp -d)
@@ -362,7 +525,14 @@ cmd_install() {
     -w '%{url_effective}' -o "$exe" "$INSTALLER_URL") || die "Download failed"
   [[ $url =~ ^https://([a-z0-9-]+\.)*line-scdn\.net/ ]] || die "Download was redirected away from LINE's CDN: $url"
   verify_installer "$exe"
+  # Keep Wine from making menu and desktop entries for LINE; see cmd_desktop.
+  reg_set_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe ''
   "$WINE" "$exe"
+  # The installer starts LINE, which unpacks bin/current (and the icon the
+  # app-grid entry uses) a few seconds after the installer exits.
+  if [[ -f $LAUNCHER ]]; then
+    local i; for i in {1..60}; do install_icon && break; sleep 1; done
+  fi
   cmd_sign
 }
 
@@ -371,12 +541,23 @@ cmd_install() {
 # not validated: Linux CA bundles don't include code-signing roots.
 verify_installer() {
   [[ "$(head -c2 "$1")" == MZ ]] || die "Download is not a Windows executable"
-  local out cur calc
-  out=$(osslsigncode verify -in "$1" 2>&1 || true)
+  local out cur calc ca=() b
+  # osslsigncode 2.2 (Ubuntu 22.04) prints nothing without -CAfile. Any CA
+  # bundle will do: the chain fails either way, and only the digests and the
+  # signer below are checked.
+  if ossl_has_cafile; then
+    for b in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+      [[ -f $b ]] && { ca=(-CAfile "$b"); break; }
+    done
+  fi
+  out=$(osslsigncode verify "${ca[@]}" -in "$1" 2>&1 || true)
   cur=$(awk '/Current message digest/{print $NF; exit}' <<<"$out")
   calc=$(awk '/Calculated message digest/{print $NF; exit}' <<<"$out")
   [[ -n $cur && $cur == "$calc" ]] || die "The installer's signature doesn't match its contents"
-  sed -n '/Signer #0:/,/Subject:/p' <<<"$out" | grep -qE 'Subject: CN=(LY|LINE) Corporation,' ||
+  # osslsigncode 2.9+ prints "Subject: CN=LY Corporation, O=...", older
+  # versions (2.8 in Ubuntu 24.04) print "Subject: /.../O=.../CN=LY Corporation".
+  sed -n '/Signer #0:/,/Subject:/p' <<<"$out" |
+    grep -qE 'Subject: (CN=(LY|LINE) Corporation,|/.*/CN=(LY|LINE) Corporation[[:space:]]*$)' ||
     die "The installer isn't signed by LY Corporation"
   log "Installer signed by LY Corporation (sha256 $(sha256sum "$1" | cut -c1-16)...)"
 }
@@ -430,7 +611,12 @@ cmd_folders() {
     /v "$DOWNLOADS_GUID" /t REG_EXPAND_SZ /d '%USERPROFILE%\Downloads' /f >/dev/null 2>&1 || true
 }
 
-fonts_current() { grep -qi '"Segoe UI Emoji"=' "$PREFIX/user.reg" 2>/dev/null; }
+# Wine writes registry changes to user.reg only after a delay, so right after
+# setup the file can lag behind; ask Wine before calling the font missing.
+fonts_current() {
+  grep -qi '"Segoe UI Emoji"=' "$PREFIX/user.reg" 2>/dev/null ||
+    "$WINE" reg query 'HKCU\Software\Wine\Fonts\Replacements' /v 'Segoe UI Emoji' >/dev/null 2>&1
+}
 
 cmd_fonts() {
   [[ -n $(fc-list Symbola family) ]] || warn "The Symbola font is not installed; emoji may show as boxes (see README: Requirements)"
@@ -440,23 +626,28 @@ cmd_fonts() {
   log "Emoji font for LINE: Symbola (color emoji fonts are hidden from Wine)"
 }
 
+# The helpers wait for LINE.exe to start and exit with it; each one runs once.
+start_helpers() {
+  [[ -n ${DISPLAY:-} ]] || return 0
+  # Hide LINE's shadow windows, which otherwise stay above other apps.
+  [[ ${LINE_KEEP_SHADOWS:-0} == 1 ]] || (setsid python3 -I "$ROOT/lib/hide-shadows.py" >/dev/null 2>&1 &)
+  # Offer copied images as files (the only way LINE pastes them) and remove
+  # the Zone.Identifier files Wine leaves next to downloads.
+  local tidy=(--downloads "$(xdg_dir DOWNLOAD Downloads)")
+  [[ ${LINE_KEEP_ZONE_FILES:-0} == 1 ]] && tidy=()
+  (setsid python3 -I "$ROOT/lib/session-helper.py" "${tidy[@]}" >/dev/null 2>&1 &)
+}
+
 cmd_launch() {
   [[ -f "$LAUNCHER" ]] || die "LINE is not installed in $PREFIX. Run: line-linux install"
   fonts_current || cmd_fonts >/dev/null
   folders_current || cmd_folders >/dev/null
+  [[ -f "$ICONS/256x256/apps/$DESKTOP_ID.png" ]] || install_icon || true
   if ! signing_current; then
     notify "Preparing LINE" "Signing Wine DLLs after a Wine update…"
     cmd_sign >"$STATE/last-sign.log" 2>&1 || { notify "LINE" "Signing failed: see $STATE/last-sign.log"; exit 1; }
   fi
-  if [[ -n ${DISPLAY:-} ]]; then
-    # Hide LINE's shadow windows, which otherwise stay above other apps.
-    [[ ${LINE_KEEP_SHADOWS:-0} == 1 ]] || (setsid python3 -I "$ROOT/lib/hide-shadows.py" >/dev/null 2>&1 &)
-    # Offer copied images as files (the only way LINE pastes them) and remove
-    # the Zone.Identifier files Wine leaves next to downloads.
-    local tidy=(--downloads "$(xdg_dir DOWNLOAD Downloads)")
-    [[ ${LINE_KEEP_ZONE_FILES:-0} == 1 ]] && tidy=()
-    (setsid python3 -I "$ROOT/lib/session-helper.py" "${tidy[@]}" >/dev/null 2>&1 &)
-  fi
+  start_helpers
   # LineLauncher.exe sits at a fixed path and starts bin/current/LINE.exe, so
   # LINE's own updates take effect without changing the desktop entry.
   cd "$LINE_DIR/bin"
@@ -478,11 +669,17 @@ cmd_capture() {
 
 # ----------------------------------------------------------- desktop glue --
 
-cmd_desktop() {
+# LINE unpacks bin/current only after the installer exits, so setup can run
+# before the icon exists; launch calls this again.
+install_icon() {
   local icon="$LINE_DIR/bin/current/assets/Square44x44Logo.targetsize-256.png"
-  if [[ -f "$icon" ]]; then
-    mkdir -p "$ICONS/256x256/apps"; cp -f "$icon" "$ICONS/256x256/apps/$DESKTOP_ID.png"
-  fi
+  [[ -f "$icon" ]] || return 1
+  mkdir -p "$ICONS/256x256/apps"; cp -f "$icon" "$ICONS/256x256/apps/$DESKTOP_ID.png"
+  command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q -t "$ICONS" 2>/dev/null || true
+}
+
+cmd_desktop() {
+  install_icon || true
   mkdir -p "$APPS" "$HOME/.local/bin"
   local bin="$HOME/.local/bin/line-linux"
   # Replace only a missing file or a link to another line-linux copy.
@@ -511,6 +708,17 @@ EOF
   reg_set_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe ''
   rm -f "$APPS/wine/Programs/LINE/LINE.desktop" "$APPS/wine/Programs/LINE/LINE Uninstall.desktop"
   rmdir "$APPS/wine/Programs/LINE" 2>/dev/null || true
+  # The installer also puts LINE.lnk on the Windows desktop, which is the
+  # Linux one, and Wine turned it into LINE.desktop. Both start LINE without
+  # line-linux; desktops that show icons (KDE, Xfce) display them. Remove
+  # them only when they point at this prefix's LINE.
+  local desk f; desk=$(xdg_dir DESKTOP Desktop)
+  for f in "$desk/LINE.desktop" "$desk/LINE.lnk"; do
+    [[ -f $f ]] || continue
+    if [[ $f == *.desktop ]]; then grep -qF "WINEPREFIX=\"$PREFIX\"" "$f" || continue
+    else grep -qa 'LineLauncher' "$f" && [[ -f $LAUNCHER ]] || continue; fi
+    rm -f "$f"
+  done
   command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
   log "Installed $(tilde "$APPS/$DESKTOP_ID.desktop")${bin:+ and ~/.local/bin/line-linux}"
 }
@@ -559,6 +767,8 @@ cmd_setup() {
   cmd_folders
   cmd_desktop
   cmd_shortcut
+  # The installer starts LINE itself, without the helpers.
+  pgrep -f '\\LINE\.exe' >/dev/null && start_helpers
   log "Done. Start LINE from the app grid, or run: line-linux launch"
 }
 
