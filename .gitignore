@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# Signing keys and Windows binaries never belong in this repository.
+*.pem
+*.key
+*.exe
+*.dll
+.ruff_cache/

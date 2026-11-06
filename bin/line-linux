@@ -1,0 +1,647 @@
+#!/usr/bin/env bash
+# line-linux: run the current Windows LINE desktop app on Linux through Wine.
+#
+# LINE 26.x checks the Authenticode signature of every Windows system DLL it
+# loads and refuses to start on Wine's unsigned DLLs ("Security verification
+# failed ... CRYPT32.dll NO_SIGNATURE"). This tool signs the Wine DLLs inside
+# the LINE prefix with a local self-signed certificate, keeps them signed
+# across Wine upgrades, launches LINE through its own launcher so LINE's
+# updater keeps working, and adds a Wayland-friendly screen capture.
+#
+# Run `line-linux help` for commands.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+SELF="$ROOT/bin/line-linux"
+WINE=${LINE_WINE:-wine}
+STATE=${XDG_DATA_HOME:-$HOME/.local/share}/line-linux
+USER=${USER:-$(id -un)}
+CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/line-linux/config
+# The Wine prefix: $LINE_PREFIX, else the one saved with `line-linux prefix`,
+# else a dedicated prefix. A dedicated prefix matters: signing changes every
+# system DLL in it, which other Wine apps sharing the prefix would also see.
+config_get() { [[ -f $CONFIG ]] && sed -n "s/^$1=//p" "$CONFIG" | tail -1; return 0; }
+PREFIX=${LINE_PREFIX:-$(config_get LINE_PREFIX)}
+PREFIX=${PREFIX:-$STATE/prefix}
+APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+ICONS=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor
+DESKTOP_ID="line-messenger"
+LINE_DIR="$PREFIX/drive_c/users/$USER/AppData/Local/LINE"
+LAUNCHER="$LINE_DIR/bin/LineLauncher.exe"
+INSTALLER_URL=https://desktop.line-scdn.net/win/new/LineInst.exe
+CAPTURE_SHORTCUT=${LINE_CAPTURE_SHORTCUT:-<Shift><Super>s}
+
+export WINEPREFIX="$PREFIX"
+export WINEDEBUG=${WINEDEBUG:--all}
+# Wine sees fonts through this config; see ensure_font_view.
+export FONTCONFIG_FILE="$STATE/fontconfig.conf"
+FONT_VIEW="$STATE/fonts"
+FONT_DIRS=(/usr/share/fonts /usr/local/share/fonts "${XDG_DATA_HOME:-$HOME/.local/share}/fonts" "$HOME/.fonts")
+
+log()  { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is not installed. Run: line-linux deps"; }
+# Show paths with ~ instead of the home folder (doctor output gets shared).
+tilde() { local p=$1; [[ $p == "$HOME"* ]] && p="~${p#"$HOME"}"; printf '%s' "$p"; }
+as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
+notify() { command -v notify-send >/dev/null && notify-send -a LINE -i "$DESKTOP_ID" "$@" 2>/dev/null || true; }
+
+# Registry values line-linux sets, recorded per prefix only when it created
+# them, so uninstall never removes a value that was there before.
+OWNED() { printf '%s/.line-linux-owned' "$PREFIX"; }
+reg_set_owned() {  # reg_set_owned NAME KEY VALUE DATA
+  (( $# == 4 )) || die "reg_set_owned needs 4 arguments"
+  local name=$1 key=$2 value=$3 data=$4
+  if ! grep -qx "$name" "$(OWNED)" 2>/dev/null; then
+    "$WINE" reg query "$key" /v "$value" >/dev/null 2>&1 && return 0  # someone else's value: leave it
+    "$WINE" reg add "$key" /v "$value" /d "$data" /f >/dev/null 2>&1 || { warn "Couldn't set $value in the prefix registry"; return 0; }
+    echo "$name" >>"$(OWNED)"
+    return 0
+  fi
+  "$WINE" reg add "$key" /v "$value" /d "$data" /f >/dev/null 2>&1 || warn "Couldn't set $value in the prefix registry"
+}
+reg_remove_owned() {  # reg_remove_owned NAME KEY VALUE
+  grep -qx "$1" "$(OWNED)" 2>/dev/null || return 0
+  "$WINE" reg delete "$2" /v "$3" /f >/dev/null 2>&1 || true
+  sed -i "/^$1\$/d" "$(OWNED)"
+}
+# Every prefix whose DLLs were signed with this machine's key.
+SIGNED_LIST() { printf '%s/signed-prefixes' "$STATE"; }
+remember_signed() { grep -qxF "$PREFIX" "$(SIGNED_LIST)" 2>/dev/null || echo "$PREFIX" >>"$(SIGNED_LIST)"; }
+forget_signed() {
+  [[ -f $(SIGNED_LIST) ]] || return 0
+  grep -vxF "$PREFIX" "$(SIGNED_LIST)" >"$(SIGNED_LIST).new" || true  # empty result is fine
+  mv -f "$(SIGNED_LIST).new" "$(SIGNED_LIST)"
+}
+
+wine_version() { command -v "$WINE" >/dev/null 2>&1 && "$WINE" --version 2>/dev/null; }
+# Records the Wine version the prefix DLLs were signed for. It lives inside
+# the prefix, so a deleted or recreated prefix never inherits it.
+marker() { printf '%s/.line-linux-signed' "$PREFIX"; }
+# Run find over the prefix's system DLLs (and .drv drivers) with extra args.
+find_dlls() {
+  local dirs=() d
+  for d in system32 syswow64; do [[ -d "$PREFIX/drive_c/windows/$d" ]] && dirs+=("$PREFIX/drive_c/windows/$d"); done
+  (( ${#dirs[@]} )) || return 0
+  find "${dirs[@]}" -maxdepth 1 -type f \( -iname '*.dll' -o -iname '*.drv' \) "$@"
+}
+line_version() {
+  local exe="$LINE_DIR/bin/current/LINE.exe"
+  [[ -f "$exe" ]] || return 0
+  # Read VS_FIXEDFILEINFO from the PE resources (signature 0xFEEF04BD).
+  python3 -I - "$exe" <<'PY' 2>/dev/null || true
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+i = data.find(b"\xbd\x04\xef\xfe")
+if i >= 0:
+    ms, ls = struct.unpack_from("<II", data, i + 8)
+    print(f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}")
+PY
+}
+
+# ------------------------------------------------------------------ fonts --
+
+# LINE 26.x uses Qt 6.6 with the GDI font engine. When the chat list shows an
+# emoji after login, Qt falls back to Noto Color Emoji, a color bitmap font
+# that Wine reports in a way that crashes Qt (access violation in
+# QWindowsFontEngine). Wine reads font directories straight from fontconfig's
+# cache and ignores <rejectfont>, so instead Wine gets a private directory of
+# symlinks to every system font except color fonts. The desktop is unchanged.
+font_view_current() {
+  [[ -f "$FONTCONFIG_FILE" && -f "$FONT_VIEW/.stamp" ]] || return 1
+  local d
+  for d in "${FONT_DIRS[@]}"; do
+    [[ -d $d ]] && find "$d" -type d -newer "$FONT_VIEW/.stamp" -print -quit | grep -q . && return 1
+  done
+  return 0
+}
+
+ensure_font_view() {
+  font_view_current && return 0
+  local tmp="$FONT_VIEW.new" f n=0
+  rm -rf "$tmp"; mkdir -p "$tmp" "$STATE"
+  while IFS= read -r f; do
+    f=${f%: }; f=${f%:}
+    [[ -f $f ]] || continue
+    mkdir -p "$tmp$(dirname "$f")"
+    ln -sfn "$f" "$tmp$f"
+    n=$((n + 1))
+  done < <(env -u FONTCONFIG_FILE fc-list ':color=False' file)
+  (( n > 0 )) || { rm -rf "$tmp"; die "fontconfig listed no fonts; is fontconfig installed?"; }
+  touch "$tmp/.stamp"
+  rm -rf "$FONT_VIEW"; mv "$tmp" "$FONT_VIEW"
+  {
+    printf '<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+    printf '<!-- Generated by line-linux: system fonts minus color fonts, for Wine only. -->\n<fontconfig>\n'
+    printf '  <dir>%s</dir>\n' "$FONT_VIEW"
+    printf '  <cachedir>%s/line-linux/fontconfig</cachedir>\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
+    # Keep the system's rendering and alias rules, but not 50-user.conf: it
+    # would add the user font folder back unfiltered (its fonts are already
+    # in the view).
+    for f in /etc/fonts/conf.d/*.conf; do
+      [[ $(basename "$f") == 50-user.conf ]] || printf '  <include ignore_missing="yes">%s</include>\n' "$f"
+    done
+    printf '</fontconfig>\n'
+  } >"$FONTCONFIG_FILE"
+  fc-cache "$FONT_VIEW" >/dev/null 2>&1 || true
+  echo "Font view for Wine: $n fonts (color fonts left out)" >&2
+}
+
+# ---------------------------------------------------------------- signing --
+
+# A file counts as signed only when its signature verifies with our own
+# certificate as the sole trusted root. Unsigned files, files signed by anyone
+# else, and files changed after signing all fail.
+is_signed() { osslsigncode verify -CAfile "$STATE/cert.pem" -in "$1" >/dev/null 2>&1; }
+
+ensure_certificate() {
+  [[ -s "$STATE/cert.pem" && -s "$STATE/key.pem" ]] && return 0
+  need openssl
+  log "Creating a local self-signed signing certificate in $STATE (not issued by Microsoft)"
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$ROOT/config/signing.cnf" \
+    -keyout "$STATE/key.pem" -out "$STATE/cert.pem" 2>/dev/null
+  chmod 600 "$STATE/key.pem"
+}
+
+# Internal: sign the given files in place, skipping ones already signed.
+sign_files() {
+  local f tmp
+  for f in "$@"; do
+    is_signed "$f" && continue
+    tmp="$f.line-linux.$$"
+    if osslsigncode sign -certs "$STATE/cert.pem" -key "$STATE/key.pem" -h sha256 \
+         -in "$f" -out "$tmp" >/dev/null 2>&1; then
+      chmod --reference="$f" "$tmp"; mv -f "$tmp" "$f"; echo "signed $f"
+    else
+      rm -f "$tmp"; echo "FAILED $f" >&2
+    fi
+  done
+}
+
+signing_current() {
+  local m; m=$(marker)
+  [[ -f "$m" ]] || return 1
+  [[ "$(cat "$m")" == "$(wine_version)" ]] || return 1
+  is_signed "$PREFIX/drive_c/windows/system32/crypt32.dll" || return 1
+  ! find_dlls -newer "$m" -print -quit | grep -q .
+}
+
+cmd_sign() {
+  need osslsigncode
+  [[ -f "$PREFIX/system.reg" ]] || die "No Wine prefix at $PREFIX"
+  if [[ ${1:-} != --force ]] && signing_current; then remember_signed; log "Wine DLLs are already signed"; return 0; fi
+  ensure_certificate
+  local m; m=$(marker)
+  # A Wine upgrade rewrites the prefix DLLs the first time Wine runs. Do that
+  # now, before signing, so it doesn't undo the signatures at LINE's start.
+  if [[ ! -f "$m" || "$(cat "$m")" != "$(wine_version)" ]]; then
+    log "Updating the Wine prefix for $(wine_version)"
+    WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -u >/dev/null 2>&1 || true
+    "${WINE}server" -w || true
+  fi
+  log "Signing Wine DLLs in $PREFIX (only files without a valid signature)"
+  # Wine can still be rewriting DLLs right after creating or updating a prefix,
+  # replacing ones just signed (for example when the installer runs first).
+  # Repeat until a full pass finds nothing left to sign, and only then write
+  # the marker that later quick checks rely on.
+  local count=0 pass signed failed
+  for pass in 1 2 3; do
+    "${WINE}server" -w 2>/dev/null || true
+    signed=$(find_dlls -print0 |
+      xargs -0 -r -n 32 -P "$(nproc)" "$SELF" _sign-files 2>"$STATE/sign-errors.txt" | wc -l)
+    count=$((count + signed))
+    (( signed == 0 || pass == 3 )) && break
+  done
+  failed=$(wc -l <"$STATE/sign-errors.txt")
+  local dll
+  for dll in system32/crypt32.dll system32/gdiplus.dll syswow64/gdiplus.dll; do
+    [[ -f "$PREFIX/drive_c/windows/$dll" ]] || continue
+    is_signed "$PREFIX/drive_c/windows/$dll" || die "$dll is still unsigned; see $STATE/sign-errors.txt"
+  done
+  wine_version >"$m"
+  remember_signed
+  log "Signed $count files ($failed could not be signed; LINE does not load those)"
+}
+
+cmd_unsign() {
+  need osslsigncode
+  [[ -s "$STATE/cert.pem" ]] || { log "No line-linux certificate, so nothing was signed"; return 0; }
+  log "Removing line-linux signatures from Wine DLLs in $PREFIX"
+  local f n=0
+  while IFS= read -r -d '' f; do
+    is_signed "$f" || continue
+    osslsigncode remove-signature -in "$f" -out "$f.unsigned" >/dev/null 2>&1 &&
+      chmod --reference="$f" "$f.unsigned" && mv -f "$f.unsigned" "$f" && n=$((n + 1))
+  done < <(find_dlls -print0)
+  rm -f "$(marker)"
+  forget_signed
+  log "Removed $n signatures. LINE 26.x will not start until you run: line-linux sign"
+}
+
+# --------------------------------------------------------------- packages --
+
+# One line per requirement: check | apt | dnf | pacman | zypper package.
+# "aur:" marks a package that's only in the Arch User Repository.
+REQUIREMENTS=(
+  "cmd:wine            | wine          | wine                  | wine             | wine"
+  "cmd:osslsigncode    | osslsigncode  | osslsigncode          | aur:osslsigncode | osslsigncode"
+  "cmd:openssl         | openssl       | openssl               | openssl          | openssl"
+  "cmd:curl            | curl          | curl                  | curl             | curl"
+  "cmd:fc-list         | fontconfig    | fontconfig            | fontconfig       | fontconfig"
+  "cmd:python3         | python3       | python3               | python           | python3"
+  "py:gi               | python3-gi    | python3-gobject       | python-gobject   | python3-gobject"
+  "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0"
+  "cmd:xclip           | xclip         | xclip                 | xclip            | xclip"
+  "font:Symbola        | fonts-symbola | gdouros-symbola-fonts | aur:ttf-symbola  | gdouros-symbola-fonts"
+)
+
+trim() { local v=$1; v=${v#"${v%%[![:space:]]*}"}; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
+
+requirement_missing() {
+  case $1 in
+    cmd:*)  ! command -v "${1#cmd:}" >/dev/null 2>&1 ;;
+    py:*)   ! python3 -c "import ${1#py:}" >/dev/null 2>&1 ;;
+    gir:*)  local g=${1#gir:}
+            ! python3 -c "import gi; gi.require_version('${g%-*}', '${g##*-}')" >/dev/null 2>&1 ;;
+    font:*) [[ -z $(env -u FONTCONFIG_FILE fc-list "${1#font:}" family 2>/dev/null) ]] ;;
+  esac
+}
+
+cmd_deps() {
+  local yes=() dry=0 a
+  for a in "$@"; do
+    case $a in --yes|-y) yes=(-y) ;; --dry-run) dry=1 ;; *) die "deps: unknown option $a" ;; esac
+  done
+  local pm col
+  for pm in apt-get dnf pacman zypper; do command -v "$pm" >/dev/null && break; pm=; done
+  case $pm in apt-get) col=1 ;; dnf) col=2 ;; pacman) col=3 ;; zypper) col=4 ;;
+    *) die "No supported package manager (apt, dnf, pacman, zypper). Install the packages listed in the README yourself." ;; esac
+
+  local line check pkg pkgs=() aur=()
+  for line in "${REQUIREMENTS[@]}"; do
+    IFS='|' read -ra f <<<"$line"
+    check=$(trim "${f[0]}"); pkg=$(trim "${f[col]}")
+    if (( dry )) || requirement_missing "$check"; then
+      if [[ $pkg == aur:* ]]; then aur+=("${pkg#aur:}"); else pkgs+=("$pkg"); fi
+    fi
+  done
+
+  if (( ${#pkgs[@]} == 0 )); then
+    log "All packages from $pm's repositories are installed"
+  elif (( dry )); then
+    log "Checking that $pm can install: ${pkgs[*]}"
+    local available=1
+    case $pm in
+      apt-get) apt-get install -s "${pkgs[@]}" >/dev/null || available=0 ;;
+      dnf)     local out; out=$(LC_ALL=C dnf install --assumeno "${pkgs[@]}" 2>&1 || true)
+               grep -qi 'no match for argument' <<<"$out" && available=0
+               grep -qiE 'operation aborted|nothing to do' <<<"$out" || available=0 ;;
+      pacman)  pacman -Sp --needed "${pkgs[@]}" >/dev/null || available=0 ;;
+      zypper)  zypper --non-interactive install --dry-run "${pkgs[@]}" >/dev/null || available=0 ;;
+    esac
+    (( available )) || die "$pm can't install all of: ${pkgs[*]}"
+    log "All packages are available"
+  else
+    log "Installing with $pm (needs sudo): ${pkgs[*]}"
+    case $pm in
+      apt-get) as_root apt-get update && as_root apt-get install "${yes[@]}" "${pkgs[@]}" ;;
+      dnf)     as_root dnf install "${yes[@]}" "${pkgs[@]}" ;;
+      pacman)  as_root pacman -S --needed ${yes:+--noconfirm} "${pkgs[@]}" ;;
+      zypper)  as_root zypper ${yes:+--non-interactive} install "${pkgs[@]}" ;;
+    esac
+  fi
+
+  if (( ${#aur[@]} )); then
+    local helper=
+    for a in paru yay; do command -v "$a" >/dev/null && { helper=$a; break; }; done
+    if (( dry )); then
+      log "From the AUR, not checked: ${aur[*]} (${helper:-no AUR helper found; install them yourself})"
+    elif [[ -n $helper ]]; then
+      log "Installing from the AUR with $helper: ${aur[*]}"
+      "$helper" -S --needed ${yes:+--noconfirm} "${aur[@]}"
+    else
+      warn "Install these from the AUR yourself (e.g. with paru or yay): ${aur[*]}"
+      requirement_missing cmd:osslsigncode && die "osslsigncode is required"
+    fi
+  fi
+
+  local v; v=$(wine_version | sed -E 's/^wine-([0-9]+).*/\1/' || true)
+  if [[ $v =~ ^[0-9]+$ ]] && (( v < 10 )); then
+    warn "$(wine_version) is older than the tested 11.0. If LINE misbehaves, install a current Wine from https://wiki.winehq.org/Download"
+  fi
+}
+
+# ------------------------------------------------------------- app & path --
+
+cmd_install() {
+  if [[ -f "$LAUNCHER" && ${1:-} != --reinstall ]]; then
+    log "LINE is already installed ($(line_version)); it updates itself on launch"; return 0
+  fi
+  if [[ -z ${LINE_PREFIX:-} && -z $(config_get LINE_PREFIX) &&
+        -f "$HOME/.wine/drive_c/users/$USER/AppData/Local/LINE/bin/LineLauncher.exe" ]]; then
+    die "LINE is already installed in ~/.wine. Choose one, then run this again:
+  use it:            $SELF prefix ~/.wine
+  separate copy:     $SELF prefix ~/.local/share/line-linux/prefix"
+  fi
+  need curl; need osslsigncode
+  if [[ ! -f "$PREFIX/system.reg" ]]; then
+    log "Creating Wine prefix $PREFIX"
+    mkdir -p "$PREFIX"
+    WINEARCH=win64 WINEDLLOVERRIDES="mscoree,mshtml=" "$WINE" wineboot -i >/dev/null 2>&1
+    "${WINE}server" -w || true
+  fi
+  cmd_sign
+  local dir; dir=$(mktemp -d)
+  # shellcheck disable=SC2064 # expand $dir now
+  trap "rm -rf '$dir'" EXIT
+  local exe="$dir/LineInst.exe" url
+  log "Downloading the official LINE installer from $INSTALLER_URL"
+  url=$(curl --proto '=https' --proto-redir '=https' --max-filesize 52428800 -fL --retry 3 \
+    -w '%{url_effective}' -o "$exe" "$INSTALLER_URL") || die "Download failed"
+  [[ $url =~ ^https://([a-z0-9-]+\.)*line-scdn\.net/ ]] || die "Download was redirected away from LINE's CDN: $url"
+  verify_installer "$exe"
+  "$WINE" "$exe"
+  cmd_sign
+}
+
+# The installer must carry an intact Authenticode signature from LY
+# Corporation (formerly LINE Corporation). The certificate chain itself is
+# not validated: Linux CA bundles don't include code-signing roots.
+verify_installer() {
+  [[ "$(head -c2 "$1")" == MZ ]] || die "Download is not a Windows executable"
+  local out cur calc
+  out=$(osslsigncode verify -in "$1" 2>&1 || true)
+  cur=$(awk '/Current message digest/{print $NF; exit}' <<<"$out")
+  calc=$(awk '/Calculated message digest/{print $NF; exit}' <<<"$out")
+  [[ -n $cur && $cur == "$calc" ]] || die "The installer's signature doesn't match its contents"
+  sed -n '/Signer #0:/,/Subject:/p' <<<"$out" | grep -qE 'Subject: CN=(LY|LINE) Corporation,' ||
+    die "The installer isn't signed by LY Corporation"
+  log "Installer signed by LY Corporation (sha256 $(sha256sum "$1" | cut -c1-16)...)"
+}
+
+# ------------------------------------------------------------ user folders --
+
+# LINE saves downloads to the Windows Downloads folder. Make that, and the
+# other user folders, the real Linux folders, so files never end up hidden
+# inside the Wine prefix. Wine usually links them when it creates a prefix,
+# but not always (some Wine builds, or a folder that didn't exist yet).
+USER_FOLDERS=(Desktop:DESKTOP Documents:DOCUMENTS Downloads:DOWNLOAD Music:MUSIC Pictures:PICTURES Videos:VIDEOS)
+DOWNLOADS_GUID='{374DE290-123F-4565-9164-39C4925E467B}'
+
+xdg_dir() {  # xdg_dir DOWNLOAD Downloads
+  local d=
+  command -v xdg-user-dir >/dev/null && d=$(xdg-user-dir "$1" 2>/dev/null)
+  [[ -n $d && $d != "$HOME" && $d != "$HOME/" ]] || d="$HOME/$2"
+  printf '%s' "$d"
+}
+
+folders_current() {
+  local pair name target link="$PREFIX/drive_c/users/$USER"
+  for pair in "${USER_FOLDERS[@]}"; do
+    name=${pair%%:*}; target=$(xdg_dir "${pair#*:}" "$name")
+    [[ -L "$link/$name" && "$(readlink -f "$link/$name")" == "$(readlink -f "$target")" ]] || return 1
+  done
+  grep -qF "\"$DOWNLOADS_GUID\"=str(2):\"%USERPROFILE%\\\\Downloads\"" "$PREFIX/user.reg" 2>/dev/null
+}
+
+cmd_folders() {
+  local pair name target link users="$PREFIX/drive_c/users/$USER"
+  [[ -d $users ]] || die "No Wine user folder at $users"
+  for pair in "${USER_FOLDERS[@]}"; do
+    name=${pair%%:*}; link="$users/$name"; target=$(xdg_dir "${pair#*:}" "$name")
+    mkdir -p "$target"
+    if [[ -L $link ]]; then
+      [[ "$(readlink -f "$link")" == "$(readlink -f "$target")" ]] && continue
+      rm -f "$link"
+    elif [[ -d $link ]]; then
+      # A real folder inside the prefix: move its files out, never overwriting.
+      find "$link" -mindepth 1 -maxdepth 1 -exec mv -n -t "$target" {} +
+      if ! rmdir "$link" 2>/dev/null; then
+        warn "Kept $link: some of its files have the same names as files in $target"
+        continue
+      fi
+    fi
+    ln -s "$target" "$link"
+    log "$name in LINE is now $target"
+  done
+  "$WINE" reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' \
+    /v "$DOWNLOADS_GUID" /t REG_EXPAND_SZ /d '%USERPROFILE%\Downloads' /f >/dev/null 2>&1 || true
+}
+
+fonts_current() { grep -qi '"Segoe UI Emoji"=' "$PREFIX/user.reg" 2>/dev/null; }
+
+cmd_fonts() {
+  [[ -n $(fc-list Symbola family) ]] || warn "The Symbola font is not installed; emoji may show as boxes (see README: Requirements)"
+  # Windows apps ask for "Segoe UI Emoji"; give them an outline font that
+  # Qt's GDI engine can draw.
+  reg_set_owned emoji-font 'HKCU\Software\Wine\Fonts\Replacements' 'Segoe UI Emoji' Symbola
+  log "Emoji font for LINE: Symbola (color emoji fonts are hidden from Wine)"
+}
+
+cmd_launch() {
+  [[ -f "$LAUNCHER" ]] || die "LINE is not installed in $PREFIX. Run: line-linux install"
+  fonts_current || cmd_fonts >/dev/null
+  folders_current || cmd_folders >/dev/null
+  if ! signing_current; then
+    notify "Preparing LINE" "Signing Wine DLLs after a Wine update…"
+    cmd_sign >"$STATE/last-sign.log" 2>&1 || { notify "LINE" "Signing failed: see $STATE/last-sign.log"; exit 1; }
+  fi
+  if [[ -n ${DISPLAY:-} ]]; then
+    # Hide LINE's shadow windows, which otherwise stay above other apps.
+    [[ ${LINE_KEEP_SHADOWS:-0} == 1 ]] || (setsid python3 -I "$ROOT/lib/hide-shadows.py" >/dev/null 2>&1 &)
+    # Offer copied images as files (the only way LINE pastes them) and remove
+    # the Zone.Identifier files Wine leaves next to downloads.
+    local tidy=(--downloads "$(xdg_dir DOWNLOAD Downloads)")
+    [[ ${LINE_KEEP_ZONE_FILES:-0} == 1 ]] && tidy=()
+    (setsid python3 -I "$ROOT/lib/session-helper.py" "${tidy[@]}" >/dev/null 2>&1 &)
+  fi
+  # LineLauncher.exe sits at a fixed path and starts bin/current/LINE.exe, so
+  # LINE's own updates take effect without changing the desktop entry.
+  cd "$LINE_DIR/bin"
+  exec "$WINE" LineLauncher.exe "$@"
+}
+
+cmd_capture() {
+  # Fallback for desktops without GNOME Shell's screenshot UI: capture through
+  # the XDG screenshot portal and put the picture on the X11 clipboard, which
+  # Wine reads directly. Paste it into a chat with Ctrl+V.
+  need xclip
+  local png
+  png=$(python3 -I "$ROOT/lib/portal-screenshot.py") || { notify "LINE capture" "Cancelled"; exit 1; }
+  # X11 clipboard, which Wine reads directly; xclip stays as owner until replaced.
+  xclip -selection clipboard -t image/png -i "$png"
+  rm -f "$png"
+  notify "LINE capture" "Copied to clipboard. Paste into a LINE chat with Ctrl+V."
+}
+
+# ----------------------------------------------------------- desktop glue --
+
+cmd_desktop() {
+  local icon="$LINE_DIR/bin/current/assets/Square44x44Logo.targetsize-256.png"
+  if [[ -f "$icon" ]]; then
+    mkdir -p "$ICONS/256x256/apps"; cp -f "$icon" "$ICONS/256x256/apps/$DESKTOP_ID.png"
+  fi
+  mkdir -p "$APPS" "$HOME/.local/bin"
+  local bin="$HOME/.local/bin/line-linux"
+  # Replace only a missing file or a link to another line-linux copy.
+  if [[ -e $bin || -L $bin ]] && ! [[ -L $bin && -f "$(dirname "$(readlink -f "$bin")")/../lib/session-helper.py" ]]; then
+    warn "Not replacing $(tilde "$bin"): it wasn't made by line-linux"
+    bin=
+  else
+    ln -sfn "$SELF" "$bin"
+  fi
+  # Desktop Exec: quote the path and escape the characters the spec reserves.
+  local exec=${SELF//\\/\\\\}; exec=${exec//\"/\\\"}; exec=${exec//\`/\\\`}; exec=${exec//\$/\\\$}
+  cat >"$APPS/$DESKTOP_ID.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=LINE
+Comment=LINE messenger (Windows version under Wine)
+Exec="$exec" launch
+Icon=$DESKTOP_ID
+Categories=Network;InstantMessaging;
+StartupNotify=true
+StartupWMClass=line.exe
+EOF
+  # Wine's own menu entries point at a .lnk and duplicate this one. Stop Wine
+  # from recreating them in this prefix on every LINE update (uninstall
+  # undoes this), then remove the two entries it made for LINE.
+  reg_set_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe ''
+  rm -f "$APPS/wine/Programs/LINE/LINE.desktop" "$APPS/wine/Programs/LINE/LINE Uninstall.desktop"
+  rmdir "$APPS/wine/Programs/LINE" 2>/dev/null || true
+  command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" 2>/dev/null || true
+  log "Installed $(tilde "$APPS/$DESKTOP_ID.desktop")${bin:+ and ~/.local/bin/line-linux}"
+}
+
+# The capture shortcut opens GNOME Shell's own screenshot UI (the one on the
+# Print key). It copies the selection to the clipboard by itself and is more
+# reliable than the screenshot portal, which some GNOME versions don't answer. The helper
+# also binds the key as it appears in non-Latin layouts such as Thai.
+gnome_shell_keys() { gsettings list-keys org.gnome.shell.keybindings 2>/dev/null | grep -qx show-screenshot-ui; }
+
+cmd_shortcut() {
+  gnome_shell_keys || { warn "GNOME Shell not found; use your desktop's screenshot tool with copy to clipboard"; return 0; }
+  python3 -I "$ROOT/lib/capture-shortcut.py" add "$CAPTURE_SHORTCUT" >/dev/null
+  log "$CAPTURE_SHORTCUT (and Print) open the screenshot tool; the capture goes to the clipboard"
+}
+
+cmd_uninstall() {
+  if [[ -f "$PREFIX/system.reg" ]]; then
+    cmd_unsign
+    reg_remove_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe
+    reg_remove_owned emoji-font 'HKCU\Software\Wine\Fonts\Replacements' 'Segoe UI Emoji'
+  fi
+  gnome_shell_keys && python3 -I "$ROOT/lib/capture-shortcut.py" remove "$CAPTURE_SHORTCUT" >/dev/null
+  rm -f "$APPS/$DESKTOP_ID.desktop" "$ICONS/256x256/apps/$DESKTOP_ID.png"
+  [[ "$(readlink "$HOME/.local/bin/line-linux" 2>/dev/null)" == "$SELF" ]] && rm -f "$HOME/.local/bin/line-linux"
+  rm -rf "$FONT_VIEW" "$FONTCONFIG_FILE" "${XDG_CACHE_HOME:-$HOME/.cache}/line-linux"
+  rm -f "$STATE/sign-errors.txt" "$STATE/last-sign.log"
+  local others=""
+  [[ -s $(SIGNED_LIST) ]] && others=$(sed "s|^$HOME|~|" "$(SIGNED_LIST)" | paste -sd, -)
+  if [[ -n $others ]]; then
+    warn "Kept the signing certificate: these prefixes are still signed with it: $others"
+  else
+    rm -f "$STATE/cert.pem" "$STATE/key.pem" "$(SIGNED_LIST)"
+  fi
+  # The copy that install.sh put in place, if any.
+  rm -rf "$STATE/app"
+  log "Removed the DLL signatures and certificate, desktop entry, capture shortcut, font settings and caches"
+  log "Kept: the Wine prefix with LINE and its data ($(tilde "$PREFIX")), and its links to your Linux user folders"
+}
+
+cmd_setup() {
+  need osslsigncode; need curl
+  cmd_install
+  cmd_sign
+  cmd_fonts
+  cmd_folders
+  cmd_desktop
+  cmd_shortcut
+  log "Done. Start LINE from the app grid, or run: line-linux launch"
+}
+
+cmd_prefix() {
+  if [[ -z ${1:-} ]]; then tilde "$PREFIX"; echo; return 0; fi
+  local p; p=$(realpath -m "$1")
+  mkdir -p "$(dirname "$CONFIG")"
+  { [[ -f $CONFIG ]] && grep -v '^LINE_PREFIX=' "$CONFIG"; echo "LINE_PREFIX=$p"; } >"$CONFIG.new"
+  mv "$CONFIG.new" "$CONFIG"
+  log "line-linux now uses the Wine prefix $(tilde "$p")"
+  if [[ $p == "$(realpath -m "$HOME/.wine")" ]]; then
+    warn "$(tilde "$p") is Wine's shared default prefix: signing changes its system DLLs for every app that uses it"
+  fi
+}
+
+cmd_doctor() {
+  local ok='\033[32mok\033[0m' bad='\033[31mmissing\033[0m'
+  printf 'Wine           %s\n' "$(wine_version || echo not found)"
+  printf 'Prefix         %s\n' "$(tilde "$PREFIX")"
+  printf 'LINE           %s\n' "$(line_version || true)"
+  printf 'Launcher       %b\n' "$([[ -f $LAUNCHER ]] && echo "$ok" || echo "$bad")"
+  printf 'Session        %s (DISPLAY=%s)\n' "${XDG_SESSION_TYPE:-?}" "${DISPLAY:-unset}"
+  local c
+  for c in osslsigncode xclip openssl; do printf '%-14s %b\n' "$c" "$(command -v $c >/dev/null && echo "$ok" || echo "$bad")"; done
+  printf 'Certificate    %b\n' "$([[ -s $STATE/cert.pem ]] && echo "$ok" || echo "$bad")"
+  if signing_current; then printf 'DLL signatures %b\n' "$ok"
+  else printf 'DLL signatures \033[31mout of date\033[0m (run: line-linux sign)\n'; fi
+  printf 'Emoji font     %b\n' "$(fonts_current && echo "$ok (Symbola)" || echo "$bad")"
+  printf 'Downloads      %b\n' "$(folders_current && echo "$ok ($(tilde "$(xdg_dir DOWNLOAD Downloads)"))" || echo "$bad (run: line-linux folders)")"
+  if font_view_current; then printf 'Font view      %b (%s fonts, no color fonts)\n' "$ok" "$(find "$FONT_VIEW" -type l | wc -l)"
+  else printf 'Font view      \033[31mout of date\033[0m (rebuilt on next launch)\n'; fi
+  printf 'Shadow watcher %s\n' "$(pgrep -f 'lib/hide-shadows.py' >/dev/null && echo running || echo 'not running (starts with launch)')"
+  printf 'Session helper %s\n' "$(pgrep -f 'lib/session-helper.py' >/dev/null && echo 'running (clipboard images, download tidy)' || echo 'not running (starts with launch)')"
+  printf 'Desktop entry  %b\n' "$([[ -f $APPS/$DESKTOP_ID.desktop ]] && echo "$ok" || echo "$bad")"
+  printf 'Capture keys   %s\n' "$(gnome_shell_keys && python3 -I "$ROOT/lib/capture-shortcut.py" show || echo none)"
+}
+
+usage() {
+  cat <<EOF
+Usage: line-linux <command>
+
+  setup        install/sign/desktop entry/capture shortcut (all of the below)
+  launch       start LINE (re-signs Wine DLLs first if Wine was upgraded)
+  capture      capture via the screenshot portal (fallback; prefer the key)
+  install      download and run the official LINE installer if missing
+  sign         sign Wine DLLs so LINE's security check passes (--force to redo)
+  fonts        hide color emoji fonts from Wine (they crash LINE after login)
+  folders      make LINE's Downloads and other user folders the Linux ones
+  unsign       remove those signatures again
+  desktop      install the app-grid entry, icon and ~/.local/bin link
+  shortcut     make $CAPTURE_SHORTCUT open GNOME's screenshot tool (to clipboard)
+  doctor       show the state of everything above
+  prefix [DIR] show or set the Wine prefix (saved in ~/.config/line-linux)
+  deps         install missing system packages (--yes, --dry-run)
+  uninstall    undo setup (keeps the Wine prefix with LINE and its data)
+
+Environment: LINE_PREFIX (default: the saved prefix, else
+~/.local/share/line-linux/prefix), LINE_WINE (default wine),
+LINE_CAPTURE_SHORTCUT (default <Shift><Super>s), LINE_KEEP_SHADOWS=1 to keep
+LINE's window shadows.
+EOF
+}
+
+# Every command that starts Wine needs the filtered font view first, or Wine
+# picks the color emoji font up again.
+case ${1:-help} in setup|launch|install|sign|unsign|fonts|folders|desktop) ensure_font_view ;; esac
+
+case ${1:-help} in
+  setup)    shift; cmd_setup "$@" ;;
+  launch)   shift; cmd_launch "$@" ;;
+  capture)  shift; cmd_capture "$@" ;;
+  install)  shift; cmd_install "$@" ;;
+  sign)     shift; cmd_sign "$@" ;;
+  unsign)   shift; cmd_unsign "$@" ;;
+  fonts)    shift; cmd_fonts "$@" ;;
+  folders)  shift; cmd_folders "$@" ;;
+  desktop)  shift; cmd_desktop "$@" ;;
+  shortcut) shift; cmd_shortcut "$@" ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  prefix)   shift; cmd_prefix "$@" ;;
+  deps)     shift; cmd_deps "$@" ;;
+  uninstall) shift; cmd_uninstall "$@" ;;
+  _sign-files) shift; sign_files "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

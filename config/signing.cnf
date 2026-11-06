@@ -1,0 +1,16 @@
+# OpenSSL request config for the local, self-signed certificate that
+# line-linux uses to add Authenticode signatures to Wine's DLLs.
+#
+# LINE 26.x refuses to start unless the Windows system DLLs it loads carry a
+# signature whose signer is "Microsoft Windows" (a neutral name fails with
+# UNTRUSTED_SIGNER). This certificate is generated locally by line-linux, is NOT
+# issued by Microsoft, and is only used inside the LINE Wine prefix.
+[req]
+prompt = no
+default_md = sha256
+default_bits = 2048
+distinguished_name = dn
+
+[dn]
+O = Microsoft Corporation
+CN = Microsoft Windows
