@@ -711,6 +711,21 @@ fonts_current() {
     "$WINE" reg query 'HKCU\Software\Wine\Fonts\Replacements' /v 'Segoe UI Emoji' >/dev/null 2>&1
 }
 
+# LINE draws its own title bar and changes its window style when maximized.
+# With window-manager decorations allowed, Wine unmaps and remaps the window
+# to apply that change, and GNOME leaves it minimized, so maximize seemed to
+# hide LINE. Only LINE.exe gets this setting; other programs in a shared
+# prefix keep their title bars.
+DECOR_KEY='HKCU\Software\Wine\AppDefaults\LINE.exe\X11 Driver'
+decorations_current() {
+  awk -v key='[Software\\\\Wine\\\\AppDefaults\\\\LINE.exe\\\\X11 Driver]' '
+    /^\[/ { here = index(tolower($0), tolower(key)) == 1 }
+    here && /^"Decorated"=/ { found = 1 }
+    END { exit !found }' "$PREFIX/user.reg" 2>/dev/null ||
+    "$WINE" reg query "$DECOR_KEY" /v Decorated >/dev/null 2>&1
+}
+set_decorations() { reg_set_owned no-decorations "$DECOR_KEY" Decorated N; }
+
 cmd_fonts() {
   [[ -n $(fc-list Symbola family) ]] || warn "The Symbola font is not installed; emoji may show as boxes (see README: Requirements)"
   # Windows apps ask for "Segoe UI Emoji"; give them an outline font that
@@ -735,6 +750,7 @@ cmd_launch() {
   [[ -f "$LAUNCHER" ]] || die "LINE is not installed in $PREFIX. Run: line-linux install"
   fonts_current || cmd_fonts >/dev/null
   folders_current || cmd_folders >/dev/null
+  decorations_current || set_decorations
   [[ -f "$ICONS/256x256/apps/$DESKTOP_ID.png" ]] || install_icon || true
   if ! signing_current; then
     notify "Preparing LINE" "Signing Wine DLLs after a Wine update…"
@@ -847,6 +863,7 @@ cmd_uninstall() {
     cmd_unsign
     reg_remove_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe
     reg_remove_owned emoji-font 'HKCU\Software\Wine\Fonts\Replacements' 'Segoe UI Emoji'
+    reg_remove_owned no-decorations "$DECOR_KEY" Decorated
   fi
   gnome_shell_keys && python3 -I "$ROOT/lib/capture-shortcut.py" remove "$CAPTURE_SHORTCUT" >/dev/null
   rm -f "$APPS/$DESKTOP_ID.desktop" "$ICONS/256x256/apps/$DESKTOP_ID.png"
@@ -871,6 +888,7 @@ cmd_setup() {
   cmd_install
   cmd_sign
   cmd_fonts
+  set_decorations
   cmd_folders
   cmd_desktop
   cmd_shortcut

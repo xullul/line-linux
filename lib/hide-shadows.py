@@ -4,15 +4,19 @@ LINE draws the shadow around each of its windows with eight thin, untitled
 ARGB popup windows. Wine maps most of them as override-redirect X windows,
 which GNOME keeps above every normal window, and some as separate dialogs, so
 after switching apps the shadows stay on screen as a dark or transparent
-frame over the other app.
+frame over the other app. The same windows are LINE's resize handles: LINE
+shows the resize cursor over them and resizes the window when they are
+dragged.
 
 A shadow window is recognized by where it is: an untitled 32-bit LINE window,
 at most MAX_THICKNESS thick, lying along the outside edge of a titled LINE
 window without overlapping it. Tooltips and menus don't match. This watcher
-sets each one's opacity to 0 (GNOME otherwise still paints a small
-rounded-corner wedge for it) and gives it an empty X shape, so clicks pass
-through. It re-applies both if Wine changes them later. The windows still
-exist, so Wine and LINE are unaffected.
+sets each one's opacity to 0, so it is never drawn. While its LINE window is
+the active window, a shadow keeps its normal shape so it can be dragged to
+resize. Otherwise it gets an empty X shape, so clicks pass through to
+whatever app is underneath. The watcher re-applies this when the active
+window changes or Wine changes the opacity or shape. The windows still exist,
+so Wine and LINE are unaffected.
 
   python3 hide-shadows.py          watch until LINE exits
   python3 hide-shadows.py --once   hide current shadows and exit
@@ -64,8 +68,18 @@ class XMapEvent(ctypes.Structure):
     ]
 
 
+class XPropertyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int), ("display", Display),
+        ("window", Window), ("atom", ctypes.c_ulong),
+        ("time", ctypes.c_ulong), ("state", ctypes.c_int),
+    ]
+
+
 class XEvent(ctypes.Union):
-    _fields_ = [("type", ctypes.c_int), ("xmap", XMapEvent), ("pad", ctypes.c_long * 24)]
+    _fields_ = [("type", ctypes.c_int), ("xmap", XMapEvent), ("xproperty", XPropertyEvent),
+                ("pad", ctypes.c_long * 24)]
 
 
 ErrorHandler = ctypes.CFUNCTYPE(ctypes.c_int, Display, ctypes.c_void_p)
@@ -86,6 +100,8 @@ x.XFree.argtypes = [ctypes.c_void_p]
 x.XSetErrorHandler.argtypes = [ErrorHandler]
 xext.XShapeCombineRectangles.argtypes = [Display, Window, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                          ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+xext.XShapeCombineMask.argtypes = [Display, Window, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_ulong, ctypes.c_int]
 
 SHAPE_BOUNDING, SHAPE_INPUT, SHAPE_SET = 0, 2, 0
 SHAPE_NOTIFY_MASK = 1
@@ -95,6 +111,7 @@ MAP_NOTIFY = 19
 CONFIGURE_NOTIFY = 22
 PROPERTY_NOTIFY = 28
 XA_CARDINAL = 6
+XA_WINDOW = 33
 
 x.XInternAtom.restype = ctypes.c_ulong
 x.XInternAtom.argtypes = [Display, ctypes.c_char_p, ctypes.c_int]
@@ -168,10 +185,11 @@ def hugs(shadow, window):
     return inside_band and not overlaps
 
 
-def opacity(dpy, win, atom):
+def prop32(dpy, win, atom, kind=XA_CARDINAL):
+    """First value of a 32-bit property, or None if it isn't set."""
     actual, fmt = ctypes.c_ulong(), ctypes.c_int()
     count, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
-    x.XGetWindowProperty(dpy, win, atom, 0, 1, False, XA_CARDINAL, ctypes.byref(actual),
+    x.XGetWindowProperty(dpy, win, atom, 0, 1, False, kind, ctypes.byref(actual),
                          ctypes.byref(fmt), ctypes.byref(count), ctypes.byref(after), ctypes.byref(data))
     value = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0] if data.value and count.value else None
     if data.value:
@@ -179,25 +197,38 @@ def opacity(dpy, win, atom):
     return value
 
 
-def shape_empty(dpy, win):
+def active_window(dpy, root):
+    return prop32(dpy, root, x.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", False), XA_WINDOW)
+
+
+def shape_state(dpy, win):
+    """'default' (no shape), 'empty', or 'other'."""
     shaped, bx, by, cx, cy = (ctypes.c_int() for _ in range(5))
     bw, bh, cw, ch = (ctypes.c_uint() for _ in range(4))
     cshaped = ctypes.c_int()
     xext.XShapeQueryExtents(dpy, win, ctypes.byref(shaped), ctypes.byref(bx), ctypes.byref(by),
                             ctypes.byref(bw), ctypes.byref(bh), ctypes.byref(cshaped),
                             ctypes.byref(cx), ctypes.byref(cy), ctypes.byref(cw), ctypes.byref(ch))
-    return bool(shaped.value) and bw.value == 0 and bh.value == 0
+    if not shaped.value:
+        return "default"
+    return "empty" if bw.value == 0 and bh.value == 0 else "other"
 
 
-def hide(dpy, win):
-    """Make a shadow window invisible and click-through. Only writes what
-    differs, so the change events it causes don't trigger it again."""
+def hide(dpy, win, clickable):
+    """Make a shadow window invisible, and click-through unless `clickable`.
+    Only writes what differs, so the change events it causes don't trigger
+    it again."""
     atom = x.XInternAtom(dpy, b"_NET_WM_WINDOW_OPACITY", False)
-    if opacity(dpy, win, atom) != 0:
+    if prop32(dpy, win, atom) != 0:
         zero = ctypes.c_ulong(0)
         x.XChangeProperty(dpy, win, atom, XA_CARDINAL, 32, 0, ctypes.byref(zero), 1)
-    if not shape_empty(dpy, win):
-        for kind in (SHAPE_BOUNDING, SHAPE_INPUT):
+    # Both shapes change together; X clips the input shape to the bounding
+    # one, so a clickable shadow needs both back to the full window.
+    state = shape_state(dpy, win)
+    for kind in (SHAPE_BOUNDING, SHAPE_INPUT):
+        if clickable and state != "default":
+            xext.XShapeCombineMask(dpy, win, kind, 0, 0, 0, SHAPE_SET)  # 0 = None: remove the shape
+        elif not clickable and state != "empty":
             xext.XShapeCombineRectangles(dpy, win, kind, 0, 0, None, 0, SHAPE_SET, 0)
     # Hear about it if Wine changes the opacity or shape later.
     x.XSelectInput(dpy, win, PROPERTY_CHANGE)
@@ -214,19 +245,24 @@ def scan(dpy, root):
         windows.extend(level)
         level = [kid for win in level for kid in children(dpy, win)]
     titled, candidates = [], []
+    active = active_window(dpy, root)
     for win in windows:
         info = line_window(dpy, root, win)
         if info is None:
             continue
         is_titled, depth, rect = info
         if is_titled:
-            titled.append(rect)
+            titled.append((rect, win == active))
         elif depth == 32 and min(rect[2], rect[3]) <= MAX_THICKNESS:
             candidates.append((win, rect))
     hidden = 0
     for win, rect in candidates:
-        if any(hugs(rect, owner) for owner in titled):
-            hide(dpy, win)
+        owners = [is_active for owner, is_active in titled if hugs(rect, owner)]
+        if owners:
+            # Resizable only while its window is active: an inactive LINE
+            # window can be covered by other apps, and its shadows, which
+            # stay on top, would then catch their clicks.
+            hide(dpy, win, clickable=any(owners))
             hidden += 1
     x.XFlush(dpy)
     return hidden
@@ -273,7 +309,8 @@ def main():
 def watch(dpy, root):
     shape_event, shape_error = ctypes.c_int(), ctypes.c_int()
     xext.XShapeQueryExtension(dpy, ctypes.byref(shape_event), ctypes.byref(shape_error))
-    x.XSelectInput(dpy, root, SUBSTRUCTURE_NOTIFY)
+    x.XSelectInput(dpy, root, SUBSTRUCTURE_NOTIFY | PROPERTY_CHANGE)
+    active_atom = x.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", False)
     scan(dpy, root)
     fd = x.XConnectionNumber(dpy)
     started = last_seen = time.monotonic()
@@ -283,7 +320,11 @@ def watch(dpy, root):
         changed = False
         while x.XPending(dpy):
             x.XNextEvent(dpy, ctypes.byref(event))
-            changed |= event.type in (MAP_NOTIFY, CONFIGURE_NOTIFY, PROPERTY_NOTIFY, shape_event.value)
+            if event.type == PROPERTY_NOTIFY and event.xproperty.window == root:
+                # The root has many busy properties; only focus matters.
+                changed |= event.xproperty.atom == active_atom
+            else:
+                changed |= event.type in (MAP_NOTIFY, CONFIGURE_NOTIFY, PROPERTY_NOTIFY, shape_event.value)
         if changed:
             # A shadow can appear before its window, so rescan once per batch.
             scan(dpy, root)

@@ -29,7 +29,12 @@ Only Ubuntu 26.10 with GNOME on Wayland has been tested. See
   fonts, so line-linux hides those fonts from Wine and uses Symbola for
   emoji.
 - A dark frame stays over other apps after you switch away from LINE. These
-  are LINE's shadow windows, and line-linux makes them invisible.
+  are LINE's shadow windows, and line-linux makes them invisible. They are
+  also LINE's resize handles, so they still resize the window while LINE is
+  the active app.
+- The maximize button makes LINE disappear until you open it again.
+  line-linux stops Wine from adding a window-manager title bar to LINE,
+  which LINE doesn't use anyway.
 - LINE's own screenshot button can't capture other apps on Wayland, and
   pasted screenshots don't arrive. Super+Shift+S opens GNOME's screenshot
   tool, and a helper turns the copied image into something LINE can paste.
@@ -137,7 +142,7 @@ line-linux uninstall    remove what setup added (see below)
 
 `uninstall` removes the DLL signatures, the app-grid entry, the
 `~/.local/bin` link, the capture shortcut and the caches. In the prefix, it
-removes the emoji and menu settings that line-linux created, and leaves
+removes the emoji, menu and decoration settings that line-linux created, and leaves
 values that existed before. It deletes the signing certificate once no other
 prefix still uses it.
 
@@ -210,11 +215,27 @@ app. They stayed on screen after you switched to another app.
 lying along the outside edge of a titled LINE window as a shadow. It looks
 for titled windows inside window-manager frames too, which GNOME nests one
 level deep and KWin two. It sets
-the shadow's opacity to 0 and gives it an empty X shape, so clicks pass
-through. Without the opacity change, GNOME still paints a small corner wedge
-for the window. If Wine changes either setting later, the helper applies it
-again. It exits when LINE exits, and leaves tooltips and menus alone.
+the shadow's opacity to 0, so it is never drawn.
+
+The shadows are also where LINE shows the resize cursor and starts a
+resize, so they must take clicks while you use LINE. While a LINE window is
+the active window (`_NET_ACTIVE_WINDOW`), its shadows keep their normal
+shape. When another app is active, they get an empty X shape, so clicks
+pass through to the app below. To resize LINE when another app is active,
+click LINE first. If Wine changes the opacity or shape later, the helper
+applies its setting again. It exits when LINE exits, and leaves tooltips and menus alone.
 `setup` also starts it for the LINE window that the installer opens.
+
+### Maximize
+
+LINE draws its own title bar and changes its window style when maximized
+or restored. Wine applies a style change that affects window-manager
+decorations by unmapping the window and mapping it again, and GNOME then
+leaves LINE minimized, so maximize seemed to hide it. line-linux sets
+`Decorated` to `N` under `HKCU\Software\Wine\AppDefaults\LINE.exe\X11 Driver`.
+Wine then never asks the window manager for decorations for LINE, and
+maximize no longer remaps the window. Other programs in a shared prefix
+keep their title bars.
 
 ### Screen capture
 
