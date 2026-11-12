@@ -726,6 +726,14 @@ decorations_current() {
 }
 set_decorations() { reg_set_owned no-decorations "$DECOR_KEY" Decorated N; }
 
+# LINE opens chat images in LineMediaPlayer.exe. Its OpenAL32.dll calls
+# __std_smf_cyl_bessel_i during startup, which Wine's msvcp140_2.dll leaves
+# unimplemented. Use the native DLL bundled with the viewer, with Wine as a
+# fallback if a future LINE version stops bundling it. Scope this to the
+# viewer so other programs in a shared prefix keep their DLL settings.
+MEDIA_RUNTIME_KEY='HKCU\Software\Wine\AppDefaults\LineMediaPlayer.exe\DllOverrides'
+set_media_runtime() { reg_set_owned media-runtime "$MEDIA_RUNTIME_KEY" msvcp140_2 native,builtin; }
+
 cmd_fonts() {
   [[ -n $(fc-list Symbola family) ]] || warn "The Symbola font is not installed; emoji may show as boxes (see README: Requirements)"
   # Windows apps ask for "Segoe UI Emoji"; give them an outline font that
@@ -751,6 +759,7 @@ cmd_launch() {
   fonts_current || cmd_fonts >/dev/null
   folders_current || cmd_folders >/dev/null
   decorations_current || set_decorations
+  set_media_runtime
   [[ -f "$ICONS/256x256/apps/$DESKTOP_ID.png" ]] || install_icon || true
   if ! signing_current; then
     notify "Preparing LINE" "Signing Wine DLLs after a Wine update…"
@@ -864,6 +873,7 @@ cmd_uninstall() {
     reg_remove_owned menu-builder 'HKCU\Software\Wine\DllOverrides' winemenubuilder.exe
     reg_remove_owned emoji-font 'HKCU\Software\Wine\Fonts\Replacements' 'Segoe UI Emoji'
     reg_remove_owned no-decorations "$DECOR_KEY" Decorated
+    reg_remove_owned media-runtime "$MEDIA_RUNTIME_KEY" msvcp140_2
   fi
   gnome_shell_keys && python3 -I "$ROOT/lib/capture-shortcut.py" remove "$CAPTURE_SHORTCUT" >/dev/null
   rm -f "$APPS/$DESKTOP_ID.desktop" "$ICONS/256x256/apps/$DESKTOP_ID.png"
@@ -889,6 +899,7 @@ cmd_setup() {
   cmd_sign
   cmd_fonts
   set_decorations
+  set_media_runtime
   cmd_folders
   cmd_desktop
   cmd_shortcut

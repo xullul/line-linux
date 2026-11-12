@@ -28,6 +28,8 @@ Only Ubuntu 26.10 with GNOME on Wayland has been tested. See
 - LINE crashes right after login. Its font engine crashes on color emoji
   fonts, so line-linux hides those fonts from Wine and uses Symbola for
   emoji.
+- Clicking a chat image opens no preview. Wine's C++ runtime crashes the
+  media viewer, so line-linux makes it use the DLL that LINE bundles.
 - A dark frame stays over other apps after you switch away from LINE. These
   are LINE's shadow windows, and line-linux makes them invisible. They are
   also LINE's resize handles, so they still resize the window while LINE is
@@ -142,9 +144,9 @@ line-linux uninstall    remove what setup added (see below)
 
 `uninstall` removes the DLL signatures, the app-grid entry, the
 `~/.local/bin` link, the capture shortcut and the caches. In the prefix, it
-removes the emoji, menu and decoration settings that line-linux created, and leaves
-values that existed before. It deletes the signing certificate once no other
-prefix still uses it.
+removes the emoji, menu, decoration and media-viewer settings that line-linux
+created, and leaves values that existed before. It deletes the signing
+certificate once no other prefix still uses it.
 
 `uninstall` keeps the Wine prefix with LINE and your LINE data, and the
 prefix's links to your folders. Delete the prefix folder to remove LINE
@@ -203,6 +205,17 @@ to a folder of links to every system font except color fonts, and it maps
 "Segoe UI Emoji" to Symbola, so emoji show in black and white. line-linux
 rebuilds the folder when system fonts change. Other programs keep using
 your normal fonts.
+
+### Image previews
+
+LINE opens chat images in a separate program, `LineMediaPlayer.exe`. Its
+audio library calls `msvcp140_2.dll.__std_smf_cyl_bessel_i` during startup,
+even when opening a still image. Wine 11.0 leaves that function unimplemented,
+so the viewer exits before showing a window.
+
+`setup` and `launch` tell Wine to use the native `msvcp140_2.dll` bundled
+with the viewer, with Wine's DLL as a fallback. This setting applies only
+to `LineMediaPlayer.exe`, and uninstall removes it if line-linux created it.
 
 ### Window shadows
 
@@ -371,6 +384,7 @@ a VM.
 
 | Feature | Status |
 |---|---|
+| Opening chat images in the preview window | Works on Ubuntu 26.10 with Wine 11.0 and LINE 26.6.0.4004 |
 | LINE's own screenshot button | Doesn't work on Wayland, see [Screen capture](#screen-capture). Not tested on X11 |
 | Downloading a file from a chat with the current folder and marker-file handling | Not confirmed yet |
 | Voice and video calls | Not tested |
