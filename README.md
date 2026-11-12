@@ -1,11 +1,9 @@
 # line-linux
 
 Run the current Windows version of the LINE desktop app (26.x) on Linux
-with Wine. LINE keeps updating itself, gets an entry in the app grid, and
-screenshots paste into chats on GNOME Wayland.
+with Wine.
 
-Only Ubuntu 26.10 with GNOME on Wayland has been tested. See
-[Compatibility](#compatibility) before using it elsewhere.
+See [Compatibility](#compatibility) before using it elsewhere.
 
 > Unofficial. LY Corporation doesn't make or endorse this project, and LINE
 > is its trademark. The repository contains no LINE code or binaries. Setup
