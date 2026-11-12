@@ -54,20 +54,32 @@ notify() { command -v notify-send >/dev/null && notify-send -a LINE -i "$DESKTOP
 # Registry values line-linux sets, recorded per prefix only when it created
 # them, so uninstall never removes a value that was there before.
 OWNED() { printf '%s/.line-linux-owned' "$PREFIX"; }
+reg_has_value() {  # reg_has_value KEY VALUE (empty VALUE means the default)
+  local value_args=(/v "$2")
+  [[ -n $2 ]] || value_args=(/ve /s)
+  # Without /s Wine invents a REG_SZ "(value not set)" for an absent default.
+  # Also preserve a class with a configured shell subkey but no default.
+  "$WINE" reg query "$1" "${value_args[@]}" 2>/dev/null |
+    grep -qE '[[:space:]]REG_[A-Z0-9_]+([[:space:]]|$)'
+}
 reg_set_owned() {  # reg_set_owned NAME KEY VALUE DATA
   (( $# == 4 )) || die "reg_set_owned needs 4 arguments"
   local name=$1 key=$2 value=$3 data=$4
+  local value_args=(/v "$value")
+  [[ -n $value ]] || value_args=(/ve)
   if ! grep -qx "$name" "$(OWNED)" 2>/dev/null; then
-    "$WINE" reg query "$key" /v "$value" >/dev/null 2>&1 && return 0  # someone else's value: leave it
-    "$WINE" reg add "$key" /v "$value" /d "$data" /f >/dev/null 2>&1 || { warn "Couldn't set $value in the prefix registry"; return 0; }
+    reg_has_value "$key" "$value" && return 0  # someone else's value: leave it
+    "$WINE" reg add "$key" "${value_args[@]}" /d "$data" /f >/dev/null 2>&1 || { warn "Couldn't set $value in the prefix registry"; return 0; }
     echo "$name" >>"$(OWNED)"
     return 0
   fi
-  "$WINE" reg add "$key" /v "$value" /d "$data" /f >/dev/null 2>&1 || warn "Couldn't set $value in the prefix registry"
+  "$WINE" reg add "$key" "${value_args[@]}" /d "$data" /f >/dev/null 2>&1 || warn "Couldn't set $value in the prefix registry"
 }
 reg_remove_owned() {  # reg_remove_owned NAME KEY VALUE
   grep -qx "$1" "$(OWNED)" 2>/dev/null || return 0
-  "$WINE" reg delete "$2" /v "$3" /f >/dev/null 2>&1 || true
+  local value_args=(/v "$3")
+  [[ -n $3 ]] || value_args=(/ve)
+  "$WINE" reg delete "$2" "${value_args[@]}" /f >/dev/null 2>&1 || true
   sed -i "/^$1\$/d" "$(OWNED)"
 }
 # Every prefix whose DLLs were signed with this machine's key.
@@ -332,6 +344,7 @@ REQUIREMENTS=(
   "py:gi               | python3-gi    | python3-gobject       | python-gobject   | python3-gobject"
   "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0 | pasting copied images and screenshots into LINE"
   "cmd:xclip           | xclip         | xclip                 | xclip            | xclip               | the capture command's clipboard copy"
+  "cmd:mpv             | mpv           | mpv                   | mpv              | mpv                 | opening downloaded video attachments when no other Linux video player is installed"
   "font:Symbola        | fonts-symbola | gdouros-symbola-fonts | aur:ttf-symbola  | gdouros-symbola-fonts | emoji, which show as empty boxes"
 )
 
@@ -734,6 +747,25 @@ set_decorations() { reg_set_owned no-decorations "$DECOR_KEY" Decorated N; }
 MEDIA_RUNTIME_KEY='HKCU\Software\Wine\AppDefaults\LineMediaPlayer.exe\DllOverrides'
 set_media_runtime() { reg_set_owned media-runtime "$MEDIA_RUNTIME_KEY" msvcp140_2 native,builtin; }
 
+# Unsupported codecs can arrive as file attachments rather than LINE videos.
+# Give otherwise unassociated video files to the Linux default player. Wine
+# does not merge HKCU classes into HKCR, so register in HKCR and check both
+# locations to leave an existing Windows player's associations alone.
+VIDEO_EXTENSIONS=(mp4 m4v mov webm mkv)
+VIDEO_OPEN_KEY='HKCR\LineLinux.Video\shell\open\command'
+set_video_associations() {
+  local ext name
+  reg_set_owned video-open "$VIDEO_OPEN_KEY" '' '"C:\windows\system32\winebrowser.exe" "%1"'
+  for ext in "${VIDEO_EXTENSIONS[@]}"; do
+    name="video-$ext"
+    if ! grep -qx "$name" "$(OWNED)" 2>/dev/null &&
+        reg_has_value "HKCU\\Software\\Classes\\.$ext" ''; then
+      continue
+    fi
+    reg_set_owned "$name" "HKCR\\.$ext" '' LineLinux.Video
+  done
+}
+
 cmd_fonts() {
   [[ -n $(fc-list Symbola family) ]] || warn "The Symbola font is not installed; emoji may show as boxes (see README: Requirements)"
   # Windows apps ask for "Segoe UI Emoji"; give them an outline font that
@@ -760,6 +792,7 @@ cmd_launch() {
   folders_current || cmd_folders >/dev/null
   decorations_current || set_decorations
   set_media_runtime
+  set_video_associations
   [[ -f "$ICONS/256x256/apps/$DESKTOP_ID.png" ]] || install_icon || true
   if ! signing_current; then
     notify "Preparing LINE" "Signing Wine DLLs after a Wine update…"
@@ -874,6 +907,11 @@ cmd_uninstall() {
     reg_remove_owned emoji-font 'HKCU\Software\Wine\Fonts\Replacements' 'Segoe UI Emoji'
     reg_remove_owned no-decorations "$DECOR_KEY" Decorated
     reg_remove_owned media-runtime "$MEDIA_RUNTIME_KEY" msvcp140_2
+    local ext
+    for ext in "${VIDEO_EXTENSIONS[@]}"; do
+      reg_remove_owned "video-$ext" "HKCR\\.$ext" ''
+    done
+    reg_remove_owned video-open "$VIDEO_OPEN_KEY" ''
   fi
   gnome_shell_keys && python3 -I "$ROOT/lib/capture-shortcut.py" remove "$CAPTURE_SHORTCUT" >/dev/null
   rm -f "$APPS/$DESKTOP_ID.desktop" "$ICONS/256x256/apps/$DESKTOP_ID.png"
@@ -900,6 +938,7 @@ cmd_setup() {
   cmd_fonts
   set_decorations
   set_media_runtime
+  set_video_associations
   cmd_folders
   cmd_desktop
   cmd_shortcut

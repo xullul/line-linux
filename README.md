@@ -30,6 +30,8 @@ Only Ubuntu 26.10 with GNOME on Wayland has been tested. See
   emoji.
 - Clicking a chat image opens no preview. Wine's C++ runtime crashes the
   media viewer, so line-linux makes it use the DLL that LINE bundles.
+- Opening a downloaded video says no Windows program is configured.
+  line-linux sends unassociated video files to your Linux video player.
 - A dark frame stays over other apps after you switch away from LINE. These
   are LINE's shadow windows, and line-linux makes them invisible. They are
   also LINE's resize handles, so they still resize the window while LINE is
@@ -107,8 +109,9 @@ prefix only for LINE is safer.
 | Shadow fix, capture shortcut | `python3`, `python3-gi` | `python3`, `python3-gobject` | `python`, `python-gobject` | `python3`, `python3-gobject` |
 | Pasting images into LINE | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
 | Fallback capture command | `xclip` | `xclip` | `xclip` | `xclip` |
+| Opening video file attachments | `mpv` | `mpv` | `mpv` | `mpv` |
 
-GTK 4, Symbola and xclip are optional. When the distribution has no package
+GTK 4, Symbola, xclip and mpv are optional. When the distribution has no package
 for one of them, `deps` says which feature is missing and continues.
 
 The helpers also use libX11, libXext and libxkbcommon, which every X11 or
@@ -144,7 +147,7 @@ line-linux uninstall    remove what setup added (see below)
 
 `uninstall` removes the DLL signatures, the app-grid entry, the
 `~/.local/bin` link, the capture shortcut and the caches. In the prefix, it
-removes the emoji, menu, decoration and media-viewer settings that line-linux
+removes the emoji, menu, decoration, media-viewer and video-file settings that line-linux
 created, and leaves values that existed before. It deletes the signing
 certificate once no other prefix still uses it.
 
@@ -216,6 +219,20 @@ so the viewer exits before showing a window.
 `setup` and `launch` tell Wine to use the native `msvcp140_2.dll` bundled
 with the viewer, with Wine's DLL as a fallback. This setting applies only
 to `LineMediaPlayer.exe`, and uninstall removes it if line-linux created it.
+
+### Video attachments
+
+Video files can appear as download-only attachments in LINE under Wine.
+On this installation, both an AV1 MP4 and an H.264/AAC MP4 were sent as
+files. Converting the codec alone did not create a video preview. This
+workaround fixes opening those attachments; it does not change existing
+file messages into LINE video messages or fix inline video previews.
+
+For downloaded file attachments, `setup` and `launch` register MP4, M4V,
+MOV, WebM and MKV files with Wine's `winebrowser.exe`, which opens them in
+the Linux default application. `deps` installs mpv as an optional player.
+Existing Windows file associations are kept. Uninstall removes only the
+associations line-linux added.
 
 ### Window shadows
 
