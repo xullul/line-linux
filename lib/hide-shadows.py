@@ -88,7 +88,6 @@ x.XDefaultRootWindow.restype = Window
 x.XDefaultRootWindow.argtypes = [Display]
 x.XGetWindowAttributes.argtypes = [Display, Window, ctypes.POINTER(XWindowAttributes)]
 x.XGetClassHint.argtypes = [Display, Window, ctypes.POINTER(XClassHint)]
-x.XFetchName.argtypes = [Display, Window, ctypes.POINTER(ctypes.c_void_p)]
 x.XQueryTree.argtypes = [Display, Window, ctypes.POINTER(Window), ctypes.POINTER(Window),
                          ctypes.POINTER(ctypes.POINTER(Window)), ctypes.POINTER(ctypes.c_uint)]
 x.XSelectInput.argtypes = [Display, Window, ctypes.c_long]
@@ -110,8 +109,10 @@ PROPERTY_CHANGE = 1 << 22
 MAP_NOTIFY = 19
 CONFIGURE_NOTIFY = 22
 PROPERTY_NOTIFY = 28
+ANY_PROPERTY_TYPE = 0
 XA_CARDINAL = 6
 XA_WINDOW = 33
+XA_WM_NAME = 39
 
 x.XInternAtom.restype = ctypes.c_ulong
 x.XInternAtom.argtypes = [Display, ctypes.c_char_p, ctypes.c_int]
@@ -152,12 +153,9 @@ def line_window(dpy, root, win):
             x.XFree(ptr)
     if cls != b"line.exe":
         return None
-    name = ctypes.c_void_p()
-    x.XFetchName(dpy, win, ctypes.byref(name))
-    titled = False
-    if name.value:
-        titled = bool(ctypes.string_at(name.value))
-        x.XFree(name.value)
+    # Not XFetchName: it only reads STRING titles, and Wine stores a title
+    # outside Latin-1, such as a Thai chat name, as COMPOUND_TEXT.
+    titled = get_property(dpy, win, XA_WM_NAME, ANY_PROPERTY_TYPE)[0] > 0
     rx, ry, child = ctypes.c_int(), ctypes.c_int(), Window()
     x.XTranslateCoordinates(dpy, win, root, 0, 0, ctypes.byref(rx), ctypes.byref(ry), ctypes.byref(child))
     return titled, attrs.depth, (rx.value, ry.value, attrs.width, attrs.height)
@@ -185,16 +183,25 @@ def hugs(shadow, window):
     return inside_band and not overlaps
 
 
-def prop32(dpy, win, atom, kind=XA_CARDINAL):
-    """First value of a 32-bit property, or None if it isn't set."""
+def get_property(dpy, win, atom, kind):
+    """(item count, first item if 32-bit else None) of a window property.
+    Reads at most one 32-bit unit, so an 8-bit property's count is capped
+    at 4. The count is 0 if the property isn't set or has another type."""
     actual, fmt = ctypes.c_ulong(), ctypes.c_int()
     count, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
     x.XGetWindowProperty(dpy, win, atom, 0, 1, False, kind, ctypes.byref(actual),
                          ctypes.byref(fmt), ctypes.byref(count), ctypes.byref(after), ctypes.byref(data))
-    value = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0] if data.value and count.value else None
+    value = None
+    if data.value and count.value and fmt.value == 32:
+        value = ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[0]
     if data.value:
         x.XFree(data)
-    return value
+    return count.value, value
+
+
+def prop32(dpy, win, atom, kind=XA_CARDINAL):
+    """First value of a 32-bit property, or None if it isn't set."""
+    return get_property(dpy, win, atom, kind)[1]
 
 
 def active_window(dpy, root):
