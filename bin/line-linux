@@ -13,7 +13,6 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 SELF="$ROOT/bin/line-linux"
-WINE=${LINE_WINE:-wine}
 STATE=${XDG_DATA_HOME:-$HOME/.local/share}/line-linux
 USER=${USER:-$(id -un)}
 CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/line-linux/config
@@ -21,8 +20,16 @@ CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/line-linux/config
 # else a dedicated prefix. A dedicated prefix matters: signing changes every
 # system DLL in it, which other Wine apps sharing the prefix would also see.
 config_get() { [[ -f $CONFIG ]] && sed -n "s/^$1=//p" "$CONFIG" | tail -1; return 0; }
-PREFIX=${LINE_PREFIX:-$(config_get LINE_PREFIX)}
+SAVED_PREFIX=$(config_get LINE_PREFIX)
+PREFIX=${LINE_PREFIX:-$SAVED_PREFIX}
 PREFIX=${PREFIX:-$STATE/prefix}
+# A saved Wine binary belongs to its prefix. A one-off LINE_PREFIX override
+# must not upgrade another prefix unless the caller also chooses that Wine.
+WINE=${LINE_WINE:-}
+if [[ -z $WINE && -n $SAVED_PREFIX && $(realpath -m "$PREFIX") == "$SAVED_PREFIX" ]]; then
+  WINE=$(config_get LINE_WINE)
+fi
+WINE=${WINE:-wine}
 APPS=${XDG_DATA_HOME:-$HOME/.local/share}/applications
 ICONS=${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor
 DESKTOP_ID="line-messenger"
@@ -97,9 +104,9 @@ wineserver_run() {
   if [[ -z ${_WINESERVER:-} ]]; then
     local w c
     w=$(command -v "$WINE" 2>/dev/null || true)
-    for c in "${w:+$(dirname "$w")/}${WINE##*/}server" "$(command -v wineserver 2>/dev/null || true)" \
-             /usr/lib/wine/wineserver /usr/lib/x86_64-linux-gnu/wine/wineserver /usr/lib64/wine/wineserver \
-             /usr/lib/wine/wineserver64; do
+    for c in "${w:+$(dirname "$w")/}${WINE##*/}server" "${w:+$(dirname "$w")/wineserver}" \
+             "$(command -v wineserver 2>/dev/null || true)" /usr/lib/wine/wineserver \
+             /usr/lib/x86_64-linux-gnu/wine/wineserver /usr/lib64/wine/wineserver /usr/lib/wine/wineserver64; do
       [[ -n $c && -x $c ]] && { _WINESERVER=$c; break; }
     done
     [[ -n ${_WINESERVER:-} ]] || { warn "Can't find wineserver next to $WINE"; return 1; }
@@ -576,7 +583,8 @@ wine_too_old() { local v; v=$(wine_major); [[ $v =~ ^[0-9]+$ ]] && (( v < MIN_WI
 wine_too_old_message() {
   printf '%s is too old for LINE: its installer stops at 1%% on Wine older than %s.0.
   Install a current Wine from WineHQ (https://gitlab.winehq.org/wine/wine/-/wikis/Download),
-  then run this again. line-linux uses whichever "wine" is first on PATH, or $LINE_WINE.' "$(wine_version)" "$MIN_WINE"
+  then run this again. line-linux uses $LINE_WINE, the binary saved for the
+  prefix, or the first "wine" on PATH, in that order.' "$(wine_version)" "$MIN_WINE"
 }
 
 # ------------------------------------------------------------- app & path --
@@ -676,6 +684,7 @@ verify_installer() {
 # but not always (some Wine builds, or a folder that didn't exist yet).
 USER_FOLDERS=(Desktop:DESKTOP Documents:DOCUMENTS Downloads:DOWNLOAD Music:MUSIC Pictures:PICTURES Videos:VIDEOS)
 DOWNLOADS_GUID='{374DE290-123F-4565-9164-39C4925E467B}'
+USER_SHELL_FOLDERS_KEY='HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
 
 xdg_dir() {  # xdg_dir DOWNLOAD Downloads
   local d=
@@ -684,13 +693,35 @@ xdg_dir() {  # xdg_dir DOWNLOAD Downloads
   printf '%s' "$d"
 }
 
+wine_downloads_path() {
+  local path
+  path=$("$WINE" winepath.exe -w "$1" 2>/dev/null) || return 1
+  path=${path%$'\r'}
+  [[ -n $path ]] || return 1
+  printf '%s' "$path"
+}
+
 folders_current() {
-  local pair name target link="$PREFIX/drive_c/users/$USER"
+  local pair name target link users="$PREFIX/drive_c/users/$USER" direct_downloads=
   for pair in "${USER_FOLDERS[@]}"; do
-    name=${pair%%:*}; target=$(xdg_dir "${pair#*:}" "$name")
-    [[ -L "$link/$name" && "$(readlink -f "$link/$name")" == "$(readlink -f "$target")" ]] || return 1
+    name=${pair%%:*}; link="$users/$name"; target=$(xdg_dir "${pair#*:}" "$name")
+    [[ -d $target ]] || return 1
+    [[ -L $link && $link -ef $target ]] && continue
+    [[ $name == Downloads && -d $link && ! -L $link ]] || return 1
+    direct_downloads=$(wine_downloads_path "$target") || return 1
   done
-  grep -qF "\"$DOWNLOADS_GUID\"=str(2):\"%USERPROFILE%\\\\Downloads\"" "$PREFIX/user.reg" 2>/dev/null
+  if [[ -n $direct_downloads ]]; then
+    "$WINE" reg query "$USER_SHELL_FOLDERS_KEY" /v "$DOWNLOADS_GUID" 2>/dev/null |
+      LINE_WIN_DOWNLOADS="$direct_downloads" awk '
+        $2 == "REG_SZ" {
+          sub(/\r$/, "")
+          sub(/^[[:blank:]]*[^[:blank:]]+[[:blank:]]+REG_SZ[[:blank:]]+/, "")
+          found = $0 == ENVIRON["LINE_WIN_DOWNLOADS"]
+        }
+        END { exit !found }'
+  else
+    grep -qF "\"$DOWNLOADS_GUID\"=str(2):\"%USERPROFILE%\\\\Downloads\"" "$PREFIX/user.reg" 2>/dev/null
+  fi
 }
 
 cmd_folders() {
@@ -700,7 +731,7 @@ cmd_folders() {
     name=${pair%%:*}; link="$users/$name"; target=$(xdg_dir "${pair#*:}" "$name")
     mkdir -p "$target"
     if [[ -L $link ]]; then
-      [[ "$(readlink -f "$link")" == "$(readlink -f "$target")" ]] && continue
+      [[ $link -ef $target ]] && continue
       rm -f "$link"
     elif [[ -d $link ]]; then
       # A real folder inside the prefix: move its files out, never overwriting.
@@ -713,8 +744,16 @@ cmd_folders() {
     ln -s "$target" "$link"
     log "$name in LINE is now $target"
   done
-  "$WINE" reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' \
-    /v "$DOWNLOADS_GUID" /t REG_EXPAND_SZ /d '%USERPROFILE%\Downloads' /f >/dev/null 2>&1 || true
+  local downloads path='%USERPROFILE%\Downloads' type=REG_EXPAND_SZ
+  downloads=$(xdg_dir DOWNLOAD Downloads)
+  if [[ ! $users/Downloads -ef $downloads ]]; then
+    # A name collision can keep the old directory in place. Still send new
+    # saves to Linux Downloads without overwriting the existing files.
+    path=$(wine_downloads_path "$downloads") || { warn "Couldn't map Downloads to $downloads"; return 0; }
+    type=REG_SZ
+  fi
+  "$WINE" reg add "$USER_SHELL_FOLDERS_KEY" /v "$DOWNLOADS_GUID" /t "$type" /d "$path" /f \
+    >/dev/null 2>&1 || warn "Couldn't set the Windows Downloads folder"
 }
 
 # Wine writes registry changes to user.reg only after a delay, so right after
@@ -949,11 +988,22 @@ cmd_setup() {
 
 cmd_prefix() {
   if [[ -z ${1:-} ]]; then tilde "$PREFIX"; echo; return 0; fi
-  local p; p=$(realpath -m "$1")
+  local p w=${2:-}
+  p=$(realpath -m "$1")
+  if [[ -n $w ]]; then
+    [[ $w != */* ]] || w=$(realpath -m "$w")
+    [[ $("$w" --version 2>/dev/null) == wine-* ]] || die "Not a Wine binary: $w"
+  elif [[ $p == "$SAVED_PREFIX" ]]; then
+    w=$(config_get LINE_WINE)
+  fi
   mkdir -p "$(dirname "$CONFIG")"
-  { [[ -f $CONFIG ]] && grep -v '^LINE_PREFIX=' "$CONFIG"; echo "LINE_PREFIX=$p"; } >"$CONFIG.new"
+  {
+    if [[ -f $CONFIG ]]; then awk '!/^LINE_(PREFIX|WINE)=/' "$CONFIG"; fi
+    printf 'LINE_PREFIX=%s\n' "$p"
+    [[ -z $w ]] || printf 'LINE_WINE=%s\n' "$w"
+  } >"$CONFIG.new"
   mv "$CONFIG.new" "$CONFIG"
-  log "line-linux now uses the Wine prefix $(tilde "$p")"
+  log "line-linux now uses the Wine prefix $(tilde "$p")${w:+ with $(tilde "$w")}"
   if [[ $p == "$(realpath -m "$HOME/.wine")" ]]; then
     warn "$(tilde "$p") is Wine's shared default prefix: signing changes its system DLLs for every app that uses it"
   fi
@@ -996,12 +1046,13 @@ Usage: line-linux <command>
   desktop      install the app-grid entry, icon and ~/.local/bin link
   shortcut     make $CAPTURE_SHORTCUT open GNOME's screenshot tool (to clipboard)
   doctor       show the state of everything above
-  prefix [DIR] show or set the Wine prefix (saved in ~/.config/line-linux)
+  prefix [DIR [WINE]] show or set the Wine prefix and its optional Wine binary
   deps         install missing system packages (--yes, --dry-run)
   uninstall    undo setup (keeps the Wine prefix with LINE and its data)
 
 Environment: LINE_PREFIX (default: the saved prefix, else
-~/.local/share/line-linux/prefix), LINE_WINE (default wine),
+~/.local/share/line-linux/prefix), LINE_WINE (default: the binary saved for
+that prefix, else wine),
 LINE_CAPTURE_SHORTCUT (default <Shift><Super>s), LINE_KEEP_SHADOWS=1 to keep
 LINE's window shadows.
 EOF
