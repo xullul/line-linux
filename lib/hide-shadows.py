@@ -18,14 +18,20 @@ whatever app is underneath. The watcher re-applies this when the active
 window changes or Wine changes the opacity or shape. The windows still exist,
 so Wine and LINE are unaffected.
 
+On Wayland the watcher can also replace LINE's blank screenshot overlay
+with the desktop picker. It only redirects LINE's borderless, always-on-top,
+fullscreen capture window, not ordinary LINE windows.
+
   python3 hide-shadows.py          watch until LINE exits
   python3 hide-shadows.py --once   hide current shadows and exit
 """
+import argparse
 import ctypes
 import ctypes.util
 import fcntl
 import os
 import select
+import subprocess
 import sys
 import time
 
@@ -77,9 +83,22 @@ class XPropertyEvent(ctypes.Structure):
     ]
 
 
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int), ("display", Display),
+        ("window", Window), ("root", Window), ("subwindow", Window),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int), ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int), ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint), ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
 class XEvent(ctypes.Union):
     _fields_ = [("type", ctypes.c_int), ("xmap", XMapEvent), ("xproperty", XPropertyEvent),
-                ("pad", ctypes.c_long * 24)]
+                ("xkey", XKeyEvent), ("pad", ctypes.c_long * 24)]
 
 
 ErrorHandler = ctypes.CFUNCTYPE(ctypes.c_int, Display, ctypes.c_void_p)
@@ -93,6 +112,9 @@ x.XQueryTree.argtypes = [Display, Window, ctypes.POINTER(Window), ctypes.POINTER
 x.XSelectInput.argtypes = [Display, Window, ctypes.c_long]
 x.XNextEvent.argtypes = [Display, ctypes.POINTER(XEvent)]
 x.XPending.argtypes = [Display]
+x.XKeysymToKeycode.argtypes = [Display, ctypes.c_ulong]
+x.XKeysymToKeycode.restype = ctypes.c_ubyte
+x.XSendEvent.argtypes = [Display, Window, ctypes.c_int, ctypes.c_long, ctypes.POINTER(XEvent)]
 x.XConnectionNumber.argtypes = [Display]
 x.XFlush.argtypes = [Display]
 x.XFree.argtypes = [ctypes.c_void_p]
@@ -104,13 +126,21 @@ xext.XShapeCombineMask.argtypes = [Display, Window, ctypes.c_int, ctypes.c_int, 
 
 SHAPE_BOUNDING, SHAPE_INPUT, SHAPE_SET = 0, 2, 0
 SHAPE_NOTIFY_MASK = 1
+STRUCTURE_NOTIFY = 1 << 17
 SUBSTRUCTURE_NOTIFY = 1 << 19
 PROPERTY_CHANGE = 1 << 22
+UNMAP_NOTIFY = 18
 MAP_NOTIFY = 19
 CONFIGURE_NOTIFY = 22
 PROPERTY_NOTIFY = 28
+KEY_PRESS, KEY_RELEASE = 2, 3
+KEY_PRESS_MASK, KEY_RELEASE_MASK = 1, 2
+CONTROL_MASK = 4
+XK_ESCAPE, XK_RETURN, XK_CONTROL_L = 0xFF1B, 0xFF0D, 0xFFE3
 ANY_PROPERTY_TYPE = 0
+XA_ATOM = 4
 XA_CARDINAL = 6
+XA_STRING = 31
 XA_WINDOW = 33
 XA_WM_NAME = 39
 
@@ -242,8 +272,158 @@ def hide(dpy, win, clickable):
     xext.XShapeSelectInput(dpy, win, SHAPE_NOTIFY_MASK)
 
 
-def scan(dpy, root):
-    """Hide every current LINE shadow window; return how many were found."""
+class CaptureRedirect:
+    """Wait for LINE to cancel its overlay before the portal takes a screenshot."""
+    def __init__(self, dpy, root, command):
+        self.dpy, self.root, self.command = dpy, root, command
+        self.state_atom = x.XInternAtom(dpy, b"_NET_WM_STATE", False)
+        self.dialog_states = {
+            x.XInternAtom(dpy, b"_NET_WM_STATE_" + name, False)
+            for name in (b"SKIP_TASKBAR", b"SKIP_PAGER")
+        }
+        self.capture_states = self.dialog_states | {
+            x.XInternAtom(dpy, b"_NET_WM_STATE_" + name, False)
+            for name in (b"ABOVE", b"FULLSCREEN")
+        }
+        self.window_type = x.XInternAtom(dpy, b"_NET_WM_WINDOW_TYPE", False)
+        self.normal_type = x.XInternAtom(dpy, b"_NET_WM_WINDOW_TYPE_NORMAL", False)
+        self.dialog_type = x.XInternAtom(dpy, b"_NET_WM_WINDOW_TYPE_DIALOG", False)
+        self.transient = x.XInternAtom(dpy, b"WM_TRANSIENT_FOR", False)
+        self.pid = x.XInternAtom(dpy, b"_NET_WM_PID", False)
+        self.overlays = set()
+        self.last_chat = self.origin = None
+        self.dismissed_at = self.picker = self.deadline = None
+        self.uri = b""
+        self.waiting_for_prompt = False
+
+    def read_property(self, win, atom, kind):
+        actual, fmt = ctypes.c_ulong(), ctypes.c_int()
+        count, after, data = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_void_p()
+        x.XGetWindowProperty(self.dpy, win, atom, 0, 32, False, kind,
+                             ctypes.byref(actual), ctypes.byref(fmt), ctypes.byref(count),
+                             ctypes.byref(after), ctypes.byref(data))
+        try:
+            if not data.value or after.value:
+                return ()
+            if fmt.value == 32:
+                return tuple(ctypes.cast(data, ctypes.POINTER(ctypes.c_ulong))[:count.value])
+            if fmt.value == 8:
+                return ctypes.string_at(data, count.value)
+            return ()
+        finally:
+            if data.value:
+                x.XFree(data)
+
+    def is_overlay(self, win):
+        # Wine may set the fullscreen state after mapping the window.
+        x.XSelectInput(self.dpy, win, PROPERTY_CHANGE | STRUCTURE_NOTIFY)
+        states = self.read_property(win, self.state_atom, XA_ATOM)
+        return (self.capture_states.issubset(states)
+                and self.read_property(win, XA_WM_NAME, XA_STRING) == b"LINE")
+
+    def is_chat(self, win):
+        return (prop32(self.dpy, win, self.window_type, XA_ATOM) == self.normal_type
+                and not self.dialog_states.intersection(self.read_property(win, self.state_atom, XA_ATOM)))
+
+    def is_paste_prompt(self, win, origin, pid):
+        if (win == origin or prop32(self.dpy, win, self.transient, XA_WINDOW) != origin
+                or prop32(self.dpy, win, self.pid) != pid
+                or prop32(self.dpy, win, self.window_type, XA_ATOM) != self.dialog_type):
+            return False
+        info = line_window(self.dpy, self.root, win)
+        if not info:
+            return False
+        _, _, (_, _, width, height) = info
+        # The Image/Text prompt is a 280 x 128 dialog before display scaling.
+        # If a LINE update changes it, leave the choice to the user.
+        return (abs(width / height - 280 / 128) < 0.05
+                and self.dialog_states.issubset(self.read_property(win, self.state_atom, XA_ATOM))
+                and self.read_property(win, XA_WM_NAME, XA_STRING) == b"LINE")
+
+    def key(self, win, symbol, *, state=0, pressed=None):
+        code = x.XKeysymToKeycode(self.dpy, symbol)
+        if not code:
+            return
+        event = XEvent()
+        event.xkey = XKeyEvent(display=self.dpy, window=win, root=self.root,
+                               keycode=code, state=state, same_screen=True)
+        if pressed is not False:
+            event.xkey.type = KEY_PRESS
+            x.XSendEvent(self.dpy, win, False, KEY_PRESS_MASK, ctypes.byref(event))
+        if pressed is not True:
+            event.xkey.type = KEY_RELEASE
+            x.XSendEvent(self.dpy, win, False, KEY_RELEASE_MASK, ctypes.byref(event))
+        x.XFlush(self.dpy)
+
+    def update(self, overlays, chat):
+        now = time.monotonic()
+        if overlays and not self.overlays and not self.busy:
+            win = chat or self.last_chat
+            self.origin = (win, prop32(self.dpy, win, self.pid)) if win else None
+            self.dismissed_at = now
+        for win in overlays - self.overlays:
+            # Escape goes to the capture window, never to the desktop.
+            self.key(win, XK_ESCAPE)
+        self.overlays = overlays
+        if not overlays:
+            self.last_chat = chat
+            if self.dismissed_at is not None:
+                if now - self.dismissed_at < 2:
+                    self.picker = subprocess.Popen([self.command, "capture", "--for-chat"],
+                                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+                self.dismissed_at = None
+
+    @property
+    def busy(self):
+        return self.dismissed_at is not None or self.picker is not None or self.deadline is not None
+
+    def paste_if_ready(self):
+        now = time.monotonic()
+        if self.dismissed_at is not None and now - self.dismissed_at >= 2:
+            self.dismissed_at = None
+        if self.picker is not None:
+            status = self.picker.poll()
+            if status is None:
+                return
+            self.uri = self.picker.communicate()[0].strip()
+            self.picker = None
+            if status == 0 and self.uri and self.origin and self.origin[1]:
+                self.deadline = now + 2
+                self.waiting_for_prompt = False
+        if self.deadline is None:
+            return
+        if now >= self.deadline:
+            self.deadline = None
+            return
+
+        origin, pid = self.origin
+        win = active_window(self.dpy, self.root)
+        if not win:
+            return
+        if self.waiting_for_prompt:
+            # Enter in this specific dialog chooses Image. Never send Enter
+            # to the composer: that would send the draft to the chat.
+            if self.is_paste_prompt(win, origin, pid):
+                self.key(win, XK_RETURN)
+                self.deadline = None
+        elif win == origin and prop32(self.dpy, win, self.pid) == pid:
+            try:
+                uri = subprocess.check_output(
+                    ["xclip", "-selection", "clipboard", "-t", "text/uri-list", "-o"],
+                    stderr=subprocess.DEVNULL, timeout=0.2).strip()
+            except (subprocess.SubprocessError, OSError):
+                return
+            if uri != self.uri or active_window(self.dpy, self.root) != origin:
+                return
+            self.key(win, XK_CONTROL_L, pressed=True)
+            self.key(win, ord('v'), state=CONTROL_MASK)
+            self.key(win, XK_CONTROL_L, state=CONTROL_MASK, pressed=False)
+            self.waiting_for_prompt = True
+            self.deadline = now + 1
+
+
+def scan(dpy, root, *, shadows=True, capture=None):
+    """Hide LINE shadows and find newly mapped capture overlays."""
     # Top-level windows, plus a few levels down: window managers reparent
     # titled windows into frames, GNOME's one level deep and KWin's two
     # (frame, then wrapper, then the client).
@@ -252,16 +432,26 @@ def scan(dpy, root):
         windows.extend(level)
         level = [kid for win in level for kid in children(dpy, win)]
     titled, candidates = [], []
-    active = active_window(dpy, root)
+    overlays = set()
+    chat = None
+    active = active_window(dpy, root) if shadows or capture else None
     for win in windows:
         info = line_window(dpy, root, win)
         if info is None:
             continue
         is_titled, depth, rect = info
         if is_titled:
-            titled.append((rect, win == active))
-        elif depth == 32 and min(rect[2], rect[3]) <= MAX_THICKNESS:
+            if shadows:
+                titled.append((rect, win == active))
+            if capture:
+                if depth == 32 and capture.is_overlay(win):
+                    overlays.add(win)
+                elif win == active and capture.is_chat(win):
+                    chat = win
+        elif shadows and depth == 32 and min(rect[2], rect[3]) <= MAX_THICKNESS:
             candidates.append((win, rect))
+    if capture:
+        capture.update(overlays, chat)
     hidden = 0
     for win, rect in candidates:
         owners = [is_active for owner, is_active in titled if hugs(rect, owner)]
@@ -297,11 +487,16 @@ def line_running():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="hide current shadows and exit")
+    parser.add_argument("--keep-shadows", action="store_true", help="do not hide shadows")
+    parser.add_argument("--capture-command", help="path to line-linux for opening the desktop picker")
+    args = parser.parse_args()
     dpy = x.XOpenDisplay(None)
     if not dpy:
         sys.exit("cannot open X display")
     root = x.XDefaultRootWindow(dpy)
-    if "--once" in sys.argv:
+    if args.once:
         print(f"hid {scan(dpy, root)} shadow windows")
         return
 
@@ -310,20 +505,22 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             return  # another watcher is already running
-        watch(dpy, root)
+        capture = CaptureRedirect(dpy, root, args.capture_command) if args.capture_command else None
+        watch(dpy, root, shadows=not args.keep_shadows, capture=capture)
 
 
-def watch(dpy, root):
+def watch(dpy, root, *, shadows, capture):
     shape_event, shape_error = ctypes.c_int(), ctypes.c_int()
     xext.XShapeQueryExtension(dpy, ctypes.byref(shape_event), ctypes.byref(shape_error))
     x.XSelectInput(dpy, root, SUBSTRUCTURE_NOTIFY | PROPERTY_CHANGE)
     active_atom = x.XInternAtom(dpy, b"_NET_ACTIVE_WINDOW", False)
-    scan(dpy, root)
+    scan(dpy, root, shadows=shadows, capture=capture)
     fd = x.XConnectionNumber(dpy)
     started = last_seen = time.monotonic()
+    next_check = started + 5
     event = XEvent()
     while True:
-        ready, _, _ = select.select([fd], [], [], 5)
+        select.select([fd], [], [], 0.1 if capture and capture.busy else 5)
         changed = False
         while x.XPending(dpy):
             x.XNextEvent(dpy, ctypes.byref(event))
@@ -332,14 +529,19 @@ def watch(dpy, root):
                 changed |= event.xproperty.atom == active_atom
             else:
                 changed |= event.type in (MAP_NOTIFY, CONFIGURE_NOTIFY, PROPERTY_NOTIFY, shape_event.value)
+                changed |= capture is not None and event.type == UNMAP_NOTIFY
         if changed:
             # A shadow can appear before its window, so rescan once per batch.
-            scan(dpy, root)
-        if not ready:
+            scan(dpy, root, shadows=shadows, capture=capture)
+        if capture and capture.busy:
+            capture.paste_if_ready()
+        now = time.monotonic()
+        if now >= next_check:
             # Allow time for LineLauncher to start LINE.exe, then exit with it.
+            next_check = now + 5
             if line_running():
-                last_seen = time.monotonic()
-            elif time.monotonic() - max(started + 60, last_seen) > 10:
+                last_seen = now
+            elif now - max(started + 60, last_seen) > 10:
                 return
 
 if __name__ == "__main__":

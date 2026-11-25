@@ -21,6 +21,7 @@ Exits once LINE has quit and the clipboard no longer holds our content.
 """
 import argparse
 import fcntl
+import hashlib
 import os
 import sys
 import tempfile
@@ -80,30 +81,39 @@ def remove_old_captures():
 class ClipboardBridge:
     def __init__(self, clipboard):
         self.clipboard = clipboard
+        self.generation = 0
         clipboard.connect("changed", self.on_changed)
         self.on_changed(clipboard)
 
     def on_changed(self, clipboard):
+        self.generation += 1
         if clipboard.is_local():
             return
         formats = clipboard.get_formats()
         if formats.contain_mime_type("text/uri-list") or not formats.contain_mime_type("image/png"):
             return
-        clipboard.read_async(["image/png"], GLib.PRIORITY_DEFAULT, None, self.on_read)
+        clipboard.read_async(["image/png"], GLib.PRIORITY_DEFAULT, None, self.on_read, self.generation)
 
-    def on_read(self, clipboard, result):
+    def on_read(self, clipboard, result, generation):
         try:
             stream, _mime = clipboard.read_finish(result)
         except GLib.Error:
             return
+        if generation != self.generation:
+            stream.close(None)
+            return
         out = Gio.MemoryOutputStream.new_resizable()
         flags = Gio.OutputStreamSpliceFlags.CLOSE_SOURCE | Gio.OutputStreamSpliceFlags.CLOSE_TARGET
-        out.splice_async(stream, flags, GLib.PRIORITY_DEFAULT, None, self.on_spliced)
+        out.splice_async(stream, flags, GLib.PRIORITY_DEFAULT, None, self.on_spliced, generation)
 
-    def on_spliced(self, out, result):
+    def on_spliced(self, out, result, generation):
         try:
             out.splice_finish(result)
         except GLib.Error:
+            return
+        # A newer clipboard selection (including a chat capture's file)
+        # must not be replaced by an image we started reading earlier.
+        if generation != self.generation:
             return
         png = out.steal_as_bytes()
         if not png.get_size():
@@ -111,9 +121,13 @@ class ClipboardBridge:
         # Copied images can be private: keep them readable only by the user.
         os.makedirs(CACHE, mode=0o700, exist_ok=True)
         os.chmod(CACHE, 0o700)
-        fd, path = tempfile.mkstemp(prefix=time.strftime("capture-%Y%m%d-%H%M%S-"), suffix=".png", dir=CACHE)
+        data = png.get_data()
+        path = os.path.join(CACHE, f"capture-{hashlib.sha256(data).hexdigest()}.png")
+        fd, tmp = tempfile.mkstemp(prefix="capture-", suffix=".png", dir=CACHE)
         with os.fdopen(fd, "wb") as f:
-            f.write(png.get_data())
+            f.write(data)
+        # Replace atomically: a chat capture may be writing the same PNG.
+        os.replace(tmp, path)
         uri = GLib.Bytes.new((GLib.filename_to_uri(path, None) + "\r\n").encode())
         self.clipboard.set_content(Gdk.ContentProvider.new_union([
             Gdk.ContentProvider.new_for_bytes("image/png", png),

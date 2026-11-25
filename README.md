@@ -36,11 +36,17 @@ Wine prefix and keeps these fixes in place across Wine and LINE updates:
   Linux video player.
 - Hides LINE's floating X11 drop-shadow windows while keeping resize edges
   working on the active window.
+- Opens the desktop screenshot picker from LINE's chat capture button on
+  Wayland. After taking the screenshot, you can crop it or draw on it in the
+  editor. Click Use image to add it to the same chat as an unsent image. To
+  resize the captured area, click Crop and drag an edge or corner.
 - Exposes copied images as clipboard files so LINE can paste them, and binds
   `Super+Shift+S` to GNOME's screenshot tool across configured keyboard layouts.
 - Links LINE's user folders (including Downloads) to your Linux folders, deletes
   Wine's `:Zone.Identifier` marker files, adds an app-grid entry for
   `LineLauncher.exe`, and suppresses Wine's duplicate menu entries.
+
+![LINE capture editor with the Arrow tool, Yellow selected, and an arrow pointing to the chat Capture button](docs/images/capture-editor.png)
 
 ## Requirements
 
@@ -61,12 +67,13 @@ For `--no-deps` or other distributions:
 | DLL signing | `osslsigncode`, `openssl` | `osslsigncode`, `openssl` | `osslsigncode` (AUR), `openssl` | `osslsigncode`, `openssl` |
 | Fonts | `fontconfig`, `fonts-symbola` | `fontconfig`, `gdouros-symbola-fonts` | `fontconfig`, `ttf-symbola` (AUR) | `fontconfig`, `gdouros-symbola-fonts` |
 | Helpers | `python3`, `python3-gi` | `python3`, `python3-gobject` | `python`, `python-gobject` | `python3`, `python3-gobject` |
-| Image paste (optional) | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
+| Image paste and screenshot editor | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
+| Screenshot editor also needs | `python3-cairo` | `python3-cairo` | `python-cairo` | `python3-cairo` |
 
-Setup also uses `curl` and `gawk`. Optional extras are `xclip` (for
-`line-linux capture`) and `mpv` (fallback video player). Tested on Ubuntu,
-Debian, Fedora, openSUSE Tumbleweed, and Arch with GNOME on Wayland and KDE
-Plasma on Wayland and X11.
+Setup also uses `curl` and `gawk`. Optional extras are `xclip` (for the Wayland
+chat capture button and `line-linux capture`) and `mpv` (fallback video player).
+Tested on Ubuntu, Debian, Fedora, openSUSE Tumbleweed, and Arch with GNOME
+on Wayland and KDE Plasma on Wayland and X11.
 
 ## Commands
 
@@ -83,7 +90,7 @@ line-linux unsign              remove line-linux signatures from the prefix
 line-linux fonts               configure the Symbola emoji font replacement
 line-linux desktop             install the app-grid entry and ~/.local/bin symlink
 line-linux shortcut            bind the GNOME screenshot shortcut
-line-linux capture             take a screenshot via the XDG portal
+line-linux capture [--annotate] open the desktop screenshot picker and copy the image
 line-linux uninstall           remove line-linux integration, keeping LINE data
 ```
 
@@ -103,7 +110,10 @@ registry entries added by `line-linux`, keeping the Wine prefix and LINE data.
 
 ## Limitations
 
-- LINE's built-in screenshot button cannot capture other apps on Wayland.
+- On Wayland, the chat capture button uses the desktop picker and a Linux
+  editor instead of LINE's screenshot toolbar. If you switch away before
+  the image appears in the chat, return to the message box and paste it
+  with Ctrl+V.
 - Inline video previews do not play inside chats; downloaded videos open in your
   Linux player.
 - Maximized photo previews can disappear or freeze on Wine 11.0 under GNOME

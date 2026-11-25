@@ -349,8 +349,9 @@ REQUIREMENTS=(
   "cmd:fc-list         | fontconfig    | fontconfig            | fontconfig       | fontconfig"
   "cmd:python3         | python3       | python3               | python           | python3"
   "py:gi               | python3-gi    | python3-gobject       | python-gobject   | python3-gobject"
-  "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0 | pasting copied images and screenshots into LINE"
-  "cmd:xclip           | xclip         | xclip                 | xclip            | xclip               | the capture command's clipboard copy"
+  "gir:Gtk-4.0         | gir1.2-gtk-4.0 | gtk4                 | gtk4             | typelib-1_0-Gtk-4_0 | image paste and the screenshot editor"
+  "py:cairo            | python3-cairo | python3-cairo         | python-cairo     | python3-cairo       | the screenshot editor"
+  "cmd:xclip           | xclip         | xclip                 | xclip            | xclip               | the Wayland chat capture button and capture command"
   "cmd:mpv             | mpv           | mpv                   | mpv              | mpv                 | opening downloaded video attachments when no other Linux video player is installed"
   "font:Symbola        | fonts-symbola | gdouros-symbola-fonts | aur:ttf-symbola  | gdouros-symbola-fonts | emoji, which show as empty boxes"
 )
@@ -816,8 +817,14 @@ cmd_fonts() {
 # The helpers wait for LINE.exe to start and exit with it; each one runs once.
 start_helpers() {
   [[ -n ${DISPLAY:-} ]] || return 0
-  # Hide LINE's shadow windows, which otherwise stay above other apps.
-  [[ ${LINE_KEEP_SHADOWS:-0} == 1 ]] || (setsid python3 -I "$ROOT/lib/hide-shadows.py" >/dev/null 2>&1 &)
+  local windows=()
+  if [[ ${XDG_SESSION_TYPE:-} == wayland ]] && command -v xclip >/dev/null; then
+    windows+=(--capture-command "$SELF")
+  fi
+  if [[ ${LINE_KEEP_SHADOWS:-0} != 1 ]] || (( ${#windows[@]} )); then
+    [[ ${LINE_KEEP_SHADOWS:-0} != 1 ]] || windows+=(--keep-shadows)
+    (setsid python3 -I "$ROOT/lib/hide-shadows.py" "${windows[@]}" >/dev/null 2>&1 &)
+  fi
   # Offer copied images as files (the only way LINE pastes them) and remove
   # the Zone.Identifier files Wine leaves next to downloads.
   local tidy=(--downloads "$(xdg_dir DOWNLOAD Downloads)")
@@ -845,16 +852,33 @@ cmd_launch() {
 }
 
 cmd_capture() {
-  # Fallback for desktops without GNOME Shell's screenshot UI: capture through
-  # the XDG screenshot portal and put the picture on the X11 clipboard, which
-  # Wine reads directly. Paste it into a chat with Ctrl+V.
+  # Used by the chat button on Wayland and as a standalone command. The
+  # portal takes the screenshot; Wine reads the result on the X11 clipboard.
   need xclip
-  local png
-  png=$(python3 -I "$ROOT/lib/portal-screenshot.py") || { notify "LINE capture" "Cancelled"; exit 1; }
-  # X11 clipboard, which Wine reads directly; xclip stays as owner until replaced.
+  local png uri flag for_chat=0 annotate=0
+  for flag in "$@"; do
+    case $flag in
+      --for-chat) for_chat=1 ;;
+      --annotate) annotate=1 ;;
+      *) die "Unknown argument to capture: $flag" ;;
+    esac
+  done
+  if (( for_chat || annotate )) && { requirement_missing gir:Gtk-4.0 || requirement_missing py:cairo; }; then
+    notify "LINE capture" "The screenshot editor needs GTK 4 and Pycairo."
+    die "The screenshot editor needs GTK 4 and Pycairo. Run: line-linux deps"
+  fi
+  png=$(python3 -I "$ROOT/lib/portal-screenshot.py" "$@") || { notify "LINE capture" "Cancelled"; exit 1; }
+  # Wine turns a file clipboard into a Windows file list. LINE accepts this
+  # as an image draft, but ignores a bitmap pasted directly.
+  if (( for_chat )); then
+    uri=$(python3 -I -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).as_uri())' "$png")
+    printf '%s\r\n' "$uri" | xclip -selection clipboard -t text/uri-list -i >/dev/null
+    printf '%s\n' "$uri"
+    return
+  fi
   xclip -selection clipboard -t image/png -i "$png"
   rm -f "$png"
-  notify "LINE capture" "Copied to clipboard. Paste into a LINE chat with Ctrl+V."
+  notify "LINE capture" "Copied to clipboard. Click the LINE message box and press Ctrl+V."
 }
 
 # ----------------------------------------------------------- desktop glue --
@@ -1037,7 +1061,7 @@ Usage: line-linux <command>
 
   setup        install/sign/desktop entry/capture shortcut (all of the below)
   launch       start LINE (re-signs Wine DLLs first if Wine was upgraded)
-  capture      capture via the screenshot portal (fallback; prefer the key)
+  capture      open the desktop screenshot picker and copy the image (--annotate to edit first)
   install      download and run the official LINE installer if missing
   sign         sign Wine DLLs so LINE's security check passes (--force to redo)
   fonts        hide color emoji fonts from Wine (they crash LINE after login)
