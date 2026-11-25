@@ -1,58 +1,34 @@
 # line-linux
 
-Run the current Windows version of the LINE desktop app (26.x) on Linux
-with Wine.
+Run the Windows version of LINE Desktop (26.x) on Linux with Wine.
 
-See [Compatibility](#compatibility) before using it elsewhere.
-
-> Unofficial. LY Corporation doesn't make or endorse this project, and LINE
-> is its trademark. The repository contains no LINE code or binaries. Setup
-> downloads the official installer from LINE's servers.
+This is an unofficial project. LY Corporation does not endorse it, and LINE
+is its trademark. This repository contains no LINE code or binaries. Setup
+downloads the official installer from LINE's servers.
 
 > [!WARNING]
-> This works around a security check. LINE refuses to run on Wine's
-> unsigned system DLLs, so line-linux creates a self-signed certificate named
-> "Microsoft Windows" and signs the DLLs in LINE's Wine prefix with it.
-> Microsoft didn't issue this certificate, and line-linux never adds it to a
-> trust store. Keep LINE in its own Wine prefix, which is the default, and
-> never import the certificate anywhere else. [DLL signatures](#dll-signatures)
-> explains the details.
+> line-linux works around LINE's DLL signature check. It signs DLLs in the
+> LINE Wine prefix with a self-signed certificate named "Microsoft Windows".
+> Microsoft did not issue it, and line-linux does not add it to a trust store.
+> Keep LINE in a dedicated prefix (the default). Never import this certificate.
+> See [DLL signatures](#dll-signatures) for details.
 
 ## What it fixes
 
-- The official installer and LINE stop with "Security verification failed …
-  NO_SIGNATURE". Both check the signatures of Wine's DLLs, which are
-  unsigned. line-linux signs them, and signs them again after a Wine upgrade.
-- LINE crashes right after login. Its font engine crashes on color emoji
-  fonts, so line-linux hides those fonts from Wine and uses Symbola for
-  emoji.
-- Clicking a chat image opens no preview. Wine's C++ runtime crashes the
-  media viewer, so line-linux makes it use the DLL that LINE bundles.
-- Opening a downloaded video says no Windows program is configured.
-  line-linux sends unassociated video files to your Linux video player.
-- A dark frame stays over other apps after you switch away from LINE. These
-  are LINE's shadow windows, and line-linux makes them invisible. They are
-  also LINE's resize handles, so they still resize the window while LINE is
-  the active app.
-- The maximize button makes LINE disappear until you open it again.
-  line-linux stops Wine from adding a window-manager title bar to LINE,
-  which LINE doesn't use anyway.
-- LINE's own screenshot button can't capture other apps on Wayland, and
-  pasted screenshots don't arrive. Super+Shift+S opens GNOME's screenshot
-  tool, and a helper turns the copied image into something LINE can paste.
-- Downloads land inside the Wine prefix, or `~/Downloads` fills up with
-  `name:Zone.Identifier` files. line-linux links LINE's Downloads folder to
-  yours and deletes those marker files.
-- The app-grid entry breaks after LINE updates itself. line-linux starts LINE
-  through LINE's own launcher, whose path never changes.
+- Starts LINE and its installer under Wine, and avoids a color emoji font crash.
+- Opens chat images and sends downloaded video attachments to your Linux player.
+- Uses your Linux Downloads folder and GNOME's screenshot tool, and hides
+  LINE's window shadows without disabling resize handles.
 
 ## Install
+
+Run as your normal user. Setup uses sudo only for system packages.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/xullul/line-linux/main/install.sh | bash
 ```
 
-Or from a clone:
+Or use a clone:
 
 ```bash
 git clone https://github.com/xullul/line-linux.git
@@ -60,353 +36,272 @@ cd line-linux
 ./install.sh
 ```
 
-`install.sh` runs these steps:
+LINE needs Wine 9.0 or later. If the distribution's Wine is too old, setup
+can offer [WineHQ](https://gitlab.winehq.org/wine/wine/-/wikis/Download) on
+Debian, Ubuntu and their derivatives. If that option is unavailable, install
+a newer Wine yourself. See [Compatibility](#compatibility) for tested setups.
 
-1. Installs missing system packages with apt, dnf, pacman or zypper, which
-   asks for your sudo password. An existing Wine, for example from WineHQ,
-   stays as it is. LINE needs Wine 9.0 or later. On Debian, Ubuntu and
-   distributions based on them, such as Linux Mint, whose own Wine is older,
-   it offers to add [WineHQ's](https://gitlab.winehq.org/wine/wine/-/wikis/Download)
-   apt repository and install Wine from there. Elsewhere it stops and asks
-   you to install a current Wine yourself. On Arch, `paru` or `yay` installs the AUR packages if you
-   have one. Without one, build them with `makepkg -si` from
-   `https://aur.archlinux.org/osslsigncode.git` and
-   `https://aur.archlinux.org/font-symbola.git`. The separate `ttf-symbola`
-   repository is an old version whose download no longer exists.
-2. Copies the tool to `~/.local/share/line-linux/app` and links `line-linux`
-   into `~/.local/bin`. You can delete the cloned folder afterwards.
-3. Creates a Wine prefix only for LINE in `~/.local/share/line-linux/prefix`
-   and signs its DLLs.
-4. Downloads LINE's installer over HTTPS, checks its LY Corporation
-   signature, and runs it. Click through it as you would on Windows.
-5. Sets up fonts, links the prefix's user folders to yours, adds LINE to the
-   app grid, and binds Super+Shift+S to the screenshot tool.
+Setup copies line-linux to `~/.local/share/line-linux/app`, creates a dedicated
+prefix at `~/.local/share/line-linux/prefix`, and runs LINE's official
+installer. Click through the installer, then open LINE from the app grid or
+run `line-linux launch`. You can delete the clone after setup.
 
-Then start LINE from the app grid or with `line-linux launch`.
+| Installer option | What it does |
+|---|---|
+| `--yes` | Skips package-manager confirmation and the WineHQ prompt |
+| `--no-deps` | Skips system package installation |
+| `--dry-run` | Checks package availability without installing; lists AUR packages without checking them |
 
-Options go after `bash -s --` when piping, for example
-`curl -fsSL … | bash -s -- --yes`. `--yes` skips the package manager's
-confirmation and the WineHQ question. `--no-deps` skips system
-packages. `--dry-run` only checks that the packages exist, and lists AUR
-packages without checking them.
+When piping to Bash, pass options after `bash -s --`, for example
+`curl -fsSL … | bash -s -- --no-deps`.
 
-To use LINE that's already installed in another prefix such as `~/.wine`,
-run `bin/line-linux prefix ~/.wine` in the cloned folder before
-`./install.sh`. For a single run, use `LINE_PREFIX=~/.wine ./install.sh`.
-Signing changes that prefix's DLLs for every program that uses it, so a
-prefix only for LINE is safer.
+To use an existing LINE installation, run `bin/line-linux prefix DIR` in the
+clone before setup, or set `LINE_PREFIX` for one run. Avoid sharing `~/.wine`
+with LINE: signing changes DLL copies used by every program in that prefix.
 
 ### Packages
 
 | Purpose | Debian / Ubuntu | Fedora | Arch | openSUSE |
 |---|---|---|---|---|
-| Wine 9.0 or later | `wine`, plus `wine32:i386` for the distribution's own Wine | `wine` | `wine` | `wine` |
+| Wine | `wine`, plus `wine32:i386` for distro Wine when needed | `wine` | `wine` | `wine` |
 | DLL signing | `osslsigncode`, `openssl` | same | `osslsigncode` (AUR), `openssl` | same |
-| Download | `curl` | `curl` | `curl` | `curl` |
 | Fonts | `fontconfig`, `fonts-symbola` | `fontconfig`, `gdouros-symbola-fonts` | `fontconfig`, `ttf-symbola` (AUR) | `fontconfig`, `gdouros-symbola-fonts` |
-| Shadow fix, capture shortcut | `python3`, `python3-gi` | `python3`, `python3-gobject` | `python`, `python-gobject` | `python3`, `python3-gobject` |
-| Pasting images into LINE | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
-| Fallback capture command | `xclip` | `xclip` | `xclip` | `xclip` |
-| Opening video file attachments | `mpv` | `mpv` | `mpv` | `mpv` |
+| Desktop helpers | `python3`, `python3-gi` | `python3`, `python3-gobject` | `python`, `python-gobject` | `python3`, `python3-gobject` |
+| Paste images | `gir1.2-gtk-4.0` | `gtk4` | `gtk4` | `typelib-1_0-Gtk-4_0` |
 
-GTK 4, Symbola, xclip and mpv are optional. When the distribution has no package
-for one of them, `deps` says which feature is missing and continues.
+Setup also checks for `curl` and `gawk`. Symbola, GTK 4, `xclip` (fallback
+capture) and `mpv` (fallback video player) are optional. The desktop helpers
+use libX11, libXext and libxkbcommon.
 
-The helpers also use libX11, libXext and libxkbcommon, which every X11 or
-Wayland desktop has. If `xdg-user-dirs` is installed, line-linux uses it to
-find translated folder names.
+On Arch, setup uses `paru` or `yay` for AUR packages. Without either, build
+[osslsigncode](https://aur.archlinux.org/osslsigncode.git) and
+[font-symbola](https://aur.archlinux.org/font-symbola.git) with `makepkg -si`.
+Use `font-symbola` if the older `ttf-symbola` source is unavailable.
+
+## Use LINE
+
+### Image previews
+
+LINE opens chat photos in `LineMediaPlayer.exe`. Under Wine 11.0, the viewer
+can exit on startup because one C++ runtime function is unimplemented.
+line-linux tells only the viewer to use LINE's bundled `msvcp140_2.dll`,
+with Wine's copy as a fallback.
+
+### Maximize
+
+On GNOME Wayland with Wine running through XWayland, Wine 11.0 sometimes hid
+the maximized image preview or left its controls unresponsive. With Wine 11.22,
+the photo stayed visible and maximize, restore, minimize, reopen and close
+worked. If you see the Wine 11.0 behavior, try
+[Wine 11.22 in LINE's own prefix](#separate-wine-build).
+
+The older `Decorated=N` setting applies to the main `LINE.exe` window, not the
+viewer. Wine 9.0 reads it; Wine 10.0 and 11.0 do not.
+
+### Separate Wine build
+
+If LINE already has a dedicated prefix, quit LINE before switching its Wine
+build. Install or unpack Wine first, then pass the path to its `wine` binary:
+
+```bash
+line-linux prefix "$HOME/.local/share/line-linux/prefix" /path/to/wine-11.22/bin/wine
+line-linux launch
+```
+
+This saves the binary for that prefix only. It does not install Wine, copy
+LINE data or change the system Wine. The next launch updates and signs the
+selected prefix as needed. Re-saving the same prefix without a Wine path
+keeps its saved binary; selecting a different prefix does not carry it over.
+To use the `wine` on PATH again, pass `wine` as the second argument.
+
+### Downloads and user folders
+
+The photo preview's Save As defaults to your Linux Downloads folder after
+setup. line-linux uses `xdg-user-dir DOWNLOAD` when configured and otherwise
+uses `~/Downloads`.
+LINE shows the Windows path under **Settings → Chats → Download folder**.
+
+Setup and launch check the prefix's links to Desktop, Documents, Downloads,
+Music, Pictures and Videos. If a real folder is in the way, line-linux moves
+its files without overwriting yours. If a filename collision prevents linking
+Downloads, it keeps both files and points new saves directly to the Linux
+folder. Run `line-linux folders` to repair the mappings yourself.
+
+Wine can leave a `file:Zone.Identifier` marker next to a download. The
+session helper removes new markers in Downloads when the matching file
+exists. It leaves older markers alone.
+
+### Screen capture
+
+1. On GNOME, press Super+Shift+S or Print. Super is the Windows key.
+2. Select an area and press Enter to copy the screenshot.
+3. In LINE, press Ctrl+V and choose **Image**. Escape chooses Text and pastes
+   the file path instead.
+
+LINE's own screenshot button cannot capture other apps on Wayland. On other
+desktops, copy an image with your screenshot tool, or try `line-linux capture`
+with `xclip` and the XDG screenshot portal.
+
+The GNOME shortcut also works in configured non-Latin keyboard layouts. The
+clipboard helper offers a copied image as both an image and a file, because
+LINE under Wine can paste the file. It keeps private copies in
+`~/.cache/line-linux/captures/` and removes them after a day.
+
+### Video attachments
+
+Downloaded MP4, M4V, MOV, WebM and MKV files open in the default Linux app
+through Wine's `winebrowser.exe` when no Windows association exists. This
+does not fix inline video previews. Both AV1 and H.264/AAC MP4s were sent as
+file attachments in testing. Uninstall removes only associations added by
+line-linux.
+
+### Quit LINE
+
+Closing the main window can leave LINE running in the tray. To exit,
+right-click the LINE tray icon and choose **Quit**, not **Sign out**.
+The right-click menu works on GNOME 51 with Wine 11.22 through XWayland.
 
 ## Commands
 
 ```text
-line-linux setup        install, sign, fonts, folders, desktop, shortcut
-line-linux launch       start LINE (re-signs DLLs first if Wine was upgraded)
-line-linux install      download and run the official LINE installer
-line-linux sign         sign Wine DLLs (--force to redo all)
-line-linux unsign       remove the signatures again
-line-linux fonts        set the emoji font
-line-linux folders      make LINE's Downloads and other user folders the Linux ones
-line-linux desktop      install the app-grid entry and ~/.local/bin link
-line-linux shortcut     make Super+Shift+S open GNOME's screenshot tool
-line-linux capture      capture via the screenshot portal (fallback)
-line-linux doctor       show the state of everything
-line-linux deps         install missing system packages (--yes, --dry-run)
-line-linux prefix [DIR] show or save the Wine prefix to use
-line-linux uninstall    remove what setup added (see below)
+line-linux launch              start LINE and re-sign DLLs if needed
+line-linux doctor              check Wine, signing, folders and desktop setup
+line-linux prefix [DIR [WINE]] show or set the prefix and its optional Wine binary
+line-linux folders             repair Linux user-folder mappings
+line-linux setup               install LINE and configure desktop integration
+line-linux deps                install missing packages (--yes, --dry-run)
+line-linux install             download and run the official LINE installer
+line-linux sign                sign Wine DLLs (--force to redo all)
+line-linux unsign              remove line-linux's signatures
+line-linux fonts               set the emoji font
+line-linux desktop             install the app-grid entry and command link
+line-linux shortcut            set the GNOME capture shortcut
+line-linux capture             capture via the XDG screenshot portal
+line-linux uninstall            remove setup changes, leaving LINE data
 ```
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `LINE_PREFIX` | the prefix saved with `line-linux prefix`, else `~/.local/share/line-linux/prefix` | Wine prefix |
-| `LINE_WINE` | `wine` | Wine binary. `wineserver` is looked for next to it, then on PATH and in Wine's usual library folders |
-| `LINE_CAPTURE_SHORTCUT` | `<Shift><Super>s` | Capture key |
-| `LINE_KEEP_SHADOWS` | unset | `1` keeps LINE's window shadows |
-| `LINE_KEEP_ZONE_FILES` | unset | `1` keeps Wine's `:Zone.Identifier` files next to downloads |
+| Variable | Effect |
+|---|---|
+| `LINE_PREFIX` | Override the saved prefix (default: `~/.local/share/line-linux/prefix`) |
+| `LINE_WINE` | Override the saved Wine binary for this run; otherwise use the binary saved for the selected prefix or `wine` on PATH |
+| `LINE_CAPTURE_SHORTCUT` | Set the GNOME capture shortcut (default: `<Shift><Super>s`) |
+| `LINE_KEEP_SHADOWS=1` | Keep LINE's window shadows |
+| `LINE_KEEP_ZONE_FILES=1` | Keep new `:Zone.Identifier` markers |
 
-`uninstall` removes the DLL signatures, the app-grid entry, the
-`~/.local/bin` link, the capture shortcut and the caches. In the prefix, it
-removes the emoji, menu, decoration, media-viewer and video-file settings that line-linux
-created, and leaves values that existed before. It deletes the signing
-certificate once no other prefix still uses it.
-
-`uninstall` keeps the Wine prefix with LINE and your LINE data, and the
-prefix's links to your folders. Delete the prefix folder to remove LINE
-completely.
+`uninstall` removes the launcher, shortcuts, caches and signatures. It also
+removes app integration settings that line-linux added to the registry. It
+keeps the prefix, LINE data and folder mappings. It deletes the signing
+certificate only when no other prefix uses it.
 
 ## How it works
 
 ### DLL signatures
 
-LINE 26.x checks the Authenticode signature of every Windows system DLL it
-loads. It accepts a DLL only if the signer is named "Microsoft Windows". Any
-other signer name fails with `UNTRUSTED_SIGNER`.
+LINE and its 32-bit installer reject Windows system DLLs without an
+Authenticode signature from a signer named "Microsoft Windows". `line-linux
+sign` signs the prefix's copies in `system32` and `syswow64` with a local
+certificate. It does not modify LINE or the system Wine installation.
 
-`line-linux sign` creates a self-signed certificate with that name in
-`~/.local/share/line-linux/` and signs the DLLs in the prefix's `system32`
-and `syswow64` folders with `osslsigncode`. It signs them before LINE's
-installer runs, because the installer is a 32-bit program that checks the
-DLLs in `syswow64` too.
+Wine can replace DLLs during a prefix update, so `launch` re-signs them
+before starting LINE. Wine can also queue replacements for its next boot;
+line-linux runs `wineboot -r` to apply them before signing. It checks each
+signature against the local certificate. The 16-bit stubs cannot be signed,
+but LINE does not load them. Only your user can read the signing key.
 
-Wine sometimes rewrites DLLs just after it creates or updates a prefix,
-which replaces DLLs that were already signed. `sign` therefore repeats until
-a full pass finds nothing left to sign. A DLL counts as signed only if its
-signature verifies against this certificate, so `sign` notices and re-signs
-any file that changed later. About 40 16-bit stubs can't be signed, and LINE
-never loads them.
-
-A Wine upgrade also rewrites the DLLs. `launch` records which Wine version
-it signed for. When the version changes, it runs `wineboot -u` and signs
-again before starting LINE.
-
-`wineboot -u` can't replace DLLs that Wine has loaded itself. Wine 11.21
-queues those and moves the new, unsigned copies into place the next time
-it starts, with the old modification time. `sign` therefore runs
-`wineboot -r` to apply the queue before it signs.
-
-line-linux changes only the DLL copies inside the LINE prefix. It doesn't
-modify LINE, and it never adds the certificate to a trust store. Anyone who
-can read `~/.local/share/line-linux/key.pem` could sign files that pass the
-same check, so only your user can read it, and `uninstall` deletes it.
-
-Before running LINE's installer, `install` checks three things: it arrived
-over HTTPS from LINE's servers, its Authenticode signature matches its
-contents, and the signer is LY Corporation. `install` doesn't validate the
-certificate chain, because Linux CA bundles don't include code-signing roots.
+Setup verifies that the installer came from LINE over HTTPS, that the
+signature matches its contents, and that the signer is LY Corporation or
+LINE Corporation. It does not check the certificate chain because Linux
+CA bundles do not include code-signing roots.
 
 ### Emoji font crash
 
-LINE 26.x uses Qt 6.6 with its GDI font engine. The first time the chat list
-shows an emoji, Qt falls back to a color emoji font such as Noto Color Emoji.
-Wine passes that font to Qt in a form that makes `QWindowsFontEngine` read
-invalid memory, and LINE crashes.
-
-Wine reads font folders directly and ignores fontconfig's `<rejectfont>`
-rule. line-linux therefore gives Wine its own `FONTCONFIG_FILE`. It points
-to a folder of links to every system font except color fonts, and it maps
-"Segoe UI Emoji" to Symbola, so emoji show in black and white. line-linux
-rebuilds the folder when system fonts change. Other programs keep using
-your normal fonts.
-
-### Image previews
-
-LINE opens chat images in a separate program, `LineMediaPlayer.exe`. Its
-audio library calls `msvcp140_2.dll.__std_smf_cyl_bessel_i` during startup,
-even when opening a still image. Wine 11.0 leaves that function unimplemented,
-so the viewer exits before showing a window.
-
-`setup` and `launch` tell Wine to use the native `msvcp140_2.dll` bundled
-with the viewer, with Wine's DLL as a fallback. This setting applies only
-to `LineMediaPlayer.exe`, and uninstall removes it if line-linux created it.
-
-### Video attachments
-
-Video files can appear as download-only attachments in LINE under Wine.
-On this installation, both an AV1 MP4 and an H.264/AAC MP4 were sent as
-files. Converting the codec alone did not create a video preview. This
-workaround fixes opening those attachments; it does not change existing
-file messages into LINE video messages or fix inline video previews.
-
-For downloaded file attachments, `setup` and `launch` register MP4, M4V,
-MOV, WebM and MKV files with Wine's `winebrowser.exe`, which opens them in
-the Linux default application. `deps` installs mpv as an optional player.
-Existing Windows file associations are kept. Uninstall removes only the
-associations line-linux added.
+LINE's Qt font engine can crash on color emoji fonts under Wine. line-linux
+uses a separate fontconfig view without color fonts and maps Segoe UI Emoji
+to Symbola. It rebuilds the view when system fonts change. Other apps are
+unaffected.
 
 ### Window shadows
 
-LINE draws each window's shadow as eight thin, untitled windows, 11 px wide
-around main windows and 20 px around dialogs. Wine creates most of them as
-override-redirect X windows, which GNOME and KDE Plasma keep above every
-app. They stayed on screen after you switched to another app.
-
-`launch` starts `lib/hide-shadows.py`. It treats an untitled LINE window
-lying along the outside edge of a titled LINE window as a shadow. It looks
-for titled windows inside window-manager frames too, which GNOME nests one
-level deep and KWin two. It sets
-the shadow's opacity to 0, so it is never drawn.
-
-The shadows are also where LINE shows the resize cursor and starts a
-resize, so they must take clicks while you use LINE. While a LINE window is
-the active window (`_NET_ACTIVE_WINDOW`), its shadows keep their normal
-shape. When another app is active, they get an empty X shape, so clicks
-pass through to the app below. To resize LINE when another app is active,
-click LINE first. If Wine changes the opacity or shape later, the helper
-applies its setting again. It exits when LINE exits, and leaves tooltips and menus alone.
-`setup` also starts it for the LINE window that the installer opens.
-
-### Maximize
-
-LINE draws its own title bar and changes its window style when maximized
-or restored. Wine applies a style change that affects window-manager
-decorations by unmapping the window and mapping it again, and GNOME then
-leaves LINE minimized, so maximize seemed to hide it. line-linux sets
-`Decorated` to `N` under `HKCU\Software\Wine\AppDefaults\LINE.exe\X11 Driver`.
-Wine then never asks the window manager for decorations for LINE, and
-maximize no longer remaps the window. Other programs in a shared prefix
-keep their title bars.
-
-### Screen capture
-
-To send a screenshot:
-
-1. Press Super+Shift+S or Print. Super is the Windows key. GNOME's
-   screenshot tool opens.
-2. Select an area and press Enter. GNOME copies the capture.
-3. In a LINE chat, press Ctrl+V. LINE asks how to paste it. Choose Image.
-   Escape counts as Text and pastes a file path.
-
-LINE's own screenshot button doesn't work on Wayland. Its overlay opens, but
-Wine can't read other apps' pixels, so the magnifier shows black. The
-overlay also doesn't stay above other windows, so its buttons don't respond.
-Wayland blocks this on purpose, and line-linux can't change it.
-
-Two helpers make the shortcut work:
-
-- `lib/capture-shortcut.py` adds Super+Shift+S to GNOME Shell's screenshot
-  shortcut. GNOME matches letter shortcuts against the active keyboard
-  layout, so the helper also binds the same key in each configured
-  non-Latin layout, such as `<Shift><Super>Thai_hohip` for Thai.
-- `lib/session-helper.py` runs while LINE runs. Wine passes an image/png
-  from the Linux clipboard to Windows programs under a broken format name,
-  and LINE ignores plain bitmaps. LINE does paste a copied file. When the
-  clipboard holds an image but no file, the helper saves a copy to
-  `~/.cache/line-linux/captures/` and offers it both as image/png and as a
-  file. Other apps still paste it as an image. Only your user can read the
-  copies. The helper deletes copies older than a day every hour while it
-  runs, and again when it starts.
-
-The shortcut uses GNOME Shell's tool instead of the XDG screenshot portal,
-because the portal doesn't answer capture requests reliably on every GNOME
-version. `line-linux capture` still uses the portal as a fallback for other
-desktops, and gives up after two minutes.
-
-### Downloads and user folders
-
-LINE has no download folder setting of its own. It saves to the Windows
-Downloads folder, `C:\users\<you>\Downloads`, which LINE shows under
-Settings → Chats → Download folder. In a Wine prefix, that folder is your
-Linux Downloads folder only if Wine linked the two. Most Wine builds do this
-when they create a prefix, but some don't, and none do if the Linux folder
-didn't exist yet.
-
-`setup` and every `launch` check that Desktop, Documents, Downloads, Music,
-Pictures and Videos in the prefix link to your Linux folders, including
-translated names from `xdg-user-dirs`. If a real folder with files is in the
-way, line-linux moves the files to your Linux folder first. It never
-overwrites a file. If two files have the same name, it keeps the folder and
-prints a warning that names it.
-
-Windows marks each download with a hidden "downloaded from the internet"
-stream. Linux file systems have no such streams, so Wine writes a visible
-`file:Zone.Identifier` file next to each download. While LINE runs, the
-session helper deletes these files as they appear in your Downloads folder,
-when a downloaded file with the same name sits next to them. It leaves older
-ones alone. Set `LINE_KEEP_ZONE_FILES=1` to keep them all.
+Wine can leave LINE's shadow windows above other apps after you switch away.
+The shadow helper hides them. Only the focused LINE window's shadows accept
+clicks, so you can still use them to resize it. Click the window first if
+another app has focus.
 
 ### Paths
 
 | What | Where |
 |---|---|
 | LINE program | `<prefix>/drive_c/users/$USER/AppData/Local/LINE/bin/current/` |
-| Launcher, same path across updates | `<prefix>/…/LINE/bin/LineLauncher.exe` |
+| Launcher, unchanged across LINE updates | `<prefix>/…/LINE/bin/LineLauncher.exe` |
 | LINE data | `<prefix>/…/LINE/Data/` |
-| Downloads | your Linux Downloads folder, `C:\users\<you>\Downloads` in LINE |
+| Downloads | Your Linux Downloads folder |
 | Pasted-image copies | `~/.cache/line-linux/captures/` |
-| Saved prefix choice | `~/.config/line-linux/config` |
-| Signing key, font links, state | `~/.local/share/line-linux/` |
+| Saved prefix and Wine binary | `~/.config/line-linux/config` |
+| Signing key, font links and state | `~/.local/share/line-linux/` |
 | App-grid entry | `~/.local/share/applications/line-messenger.desktop` |
 
-`desktop` also turns off Wine's menu builder in the LINE prefix. Otherwise
-Wine adds a duplicate LINE entry under `wine/Programs/LINE` each time LINE
-updates.
+The desktop command disables Wine's menu builder in the LINE prefix to
+prevent duplicate LINE entries after updates.
 
 ## Repository layout
 
-- `install.sh` installs packages, the tool and LINE in one step.
-- `bin/line-linux` is the command-line tool, written in bash.
-- `lib/hide-shadows.py` hides LINE's shadow windows while LINE runs.
-- `lib/session-helper.py` runs with LINE, offers copied images as files and
-  removes the marker files from Downloads.
-- `lib/capture-shortcut.py` binds the capture key in every keyboard layout.
-- `lib/portal-screenshot.py` takes a screenshot through the XDG portal, for
-  the fallback command.
+- `install.sh` installs packages, line-linux and LINE.
+- `bin/line-linux` is the launcher and command-line tool.
+- `lib/` contains the shadow, clipboard, Downloads and screenshot helpers.
 - `config/signing.cnf` sets the name on the signing certificate.
 
 ## Compatibility
 
-LINE 26.x needs Wine 9.0 or later. Under Wine 8.0 and older, its installer
-stops at 1%. Where the distribution's Wine is older, `deps` installs Wine
-from WineHQ on Debian and Ubuntu, and stops with a message elsewhere.
+Wine 9.0 is the minimum for LINE 26.x. On Wine 8.0 or older the installer can
+stop at 1%. The minimum does not guarantee every desktop feature works.
 
 ### Distributions
 
-Tested with LINE 26.6.0.4004 on 2026-11-06. "Starts" means `install.sh`
-installed the packages, the official installer ran and LINE showed its
-login screen; login was tested only on the first row.
+Tested with LINE 26.6.0.4004 on 2026-11-06. "Starts" means installation
+finished and LINE reached the sign-in screen. Only the first row was tested
+past sign-in in this distribution test.
 
 | Distribution | Wine | Result |
 |---|---|---|
-| Ubuntu 26.10 | 11.0 from WineHQ | Works: login, chats, Thai text, emoji, settings, screenshots pasted into chats |
-| Ubuntu 26.04 | 10.0 (Ubuntu) | Starts, installed with the `curl … \| bash` command |
-| Ubuntu 24.04 | 9.0 (Ubuntu) | Starts. `deps` adds `wine32:i386` |
-| Ubuntu 22.04 | 11.0 from WineHQ | Starts. Ubuntu's own Wine 6.0 is too old, so `deps` installs WineHQ's |
-| Ubuntu 20.04 | 10.0 from WineHQ | Starts. No GTK 4, so copied images don't paste into LINE |
-| Debian 13 | 10.0 (Debian) | Starts. `deps` adds `wine32:i386` |
-| Debian 12 | 11.0 from WineHQ | Starts. Debian's own Wine 8.0 is too old, so `deps` installs WineHQ's, also over an installed 8.0 |
+| Ubuntu 26.10 | 11.0 from WineHQ | Login, chats, Thai text, emoji, settings and screenshot paste |
+| Ubuntu 26.04 | 10.0 (Ubuntu) | Starts with the piped installer |
+| Ubuntu 24.04 | 9.0 (Ubuntu) | Starts with `wine32:i386` |
+| Ubuntu 22.04 | 11.0 from WineHQ | Starts; distro Wine 6.0 is too old |
+| Ubuntu 20.04 | 10.0 from WineHQ | Starts; no GTK 4 clipboard helper |
+| Debian 13 | 10.0 (Debian) | Starts with `wine32:i386` |
+| Debian 12 | 11.0 from WineHQ | Starts; replaces distro Wine 8.0 if installed |
 | Fedora 43 | 11.0 Staging (Fedora) | Starts |
 | openSUSE Tumbleweed | 11.20 (openSUSE) | Starts |
-| Arch | 11.21 (Arch) | Starts. osslsigncode and Symbola come from the AUR |
-| Linux Mint 22.3 | | Not tested yet. Based on Ubuntu 24.04 |
+| Arch | 11.21 (Arch) | Starts; signing and Symbola packages from the AUR |
+| Linux Mint 22.3 | | Not tested |
 
-Not possible: Ubuntu 18.04 and 16.04 (no Wine 9.0 or later exists for them),
-and AlmaLinux and other RHEL-based systems (no usable Wine in the
-distribution or EPEL, and WineHQ doesn't build for them).
-
-Ubuntu 26.10 ran on real hardware. The others ran in Podman containers with
-a virtual X display, and Debian 13 and Kubuntu 24.04 also as live systems in
-a VM.
+Wine 9.0 or later was not available for Ubuntu 18.04, Ubuntu 16.04 or
+AlmaLinux in the repositories checked. Ubuntu 26.10 was tested on real
+hardware, other distributions in Podman with a virtual display. Debian 13
+and Kubuntu 24.04 were also tested as live systems in a VM.
 
 ### Desktops
 
 | Desktop | Result |
 |---|---|
-| GNOME 51 on Wayland (Ubuntu 26.10) | Works, including window shadows, Super+Shift+S with English and Thai layouts, and pasting screenshots |
-| KDE Plasma 6.3 on Wayland (Debian 13 live, in a VM) | Starts. Window shadows hidden, app-grid entry and taskbar icon, a copied image offered as a file. Copy screenshots with Spectacle: the capture key needs GNOME Shell. KWin passes the clipboard to LINE only while a LINE window has focus, which it has when you press Ctrl+V |
-| KDE Plasma 5.27 on X11 (Kubuntu 24.04 live, in a VM) | Starts. Window shadows hidden, app-grid entry and taskbar icon |
-| Xfce and other desktops | Not tested. Use your desktop's screenshot tool with copy to clipboard |
+| GNOME 51 on Wayland (Ubuntu 26.10) | Window shadows, capture shortcut with English and Thai layouts, and screenshot paste verified |
+| KDE Plasma 6.3 on Wayland (Debian 13 live VM) | Starts. Shadows hidden, launcher and taskbar icon present, copied images offered as files. Use Spectacle for capture; focus LINE before pasting |
+| KDE Plasma 5.27 on X11 (Kubuntu 24.04 live VM) | Starts. Shadows hidden, launcher and taskbar icon present |
+| Xfce and other desktops | Not tested. Use your desktop's screenshot tool to copy captures |
 
 ### Features
 
 | Feature | Status |
 |---|---|
-| Opening chat images in the preview window | Works on Ubuntu 26.10 with Wine 11.0 and LINE 26.6.0.4004 |
-| LINE's own screenshot button | Doesn't work on Wayland, see [Screen capture](#screen-capture). Not tested on X11 |
-| Downloading a file from a chat with the current folder and marker-file handling | Not confirmed yet |
+| Open a chat photo | Verified with Wine 11.0 and 11.22 on Ubuntu 26.10, LINE 26.6.0.4004 |
+| Maximize, restore, minimize and close a photo preview | Verified with Wine 11.22 on GNOME 51 through XWayland; see [Maximize](#maximize) for the Wine 11.0 issue |
+| Preview Save As default | Verified in Linux Downloads on the same Wine 11.22 setup |
+| LINE's own screenshot button | Does not work on Wayland; not tested on X11 |
+| Download a chat file and remove its marker | Not confirmed |
 | Voice and video calls | Not tested |
 
-Reports from other setups are welcome. Please include the output of
-`line-linux doctor`. It shows paths relative to your home folder, but check
-it before posting.
+For a report from another setup, include `line-linux doctor` output. Check
+it for private paths before posting.
 
 ## License
 
